@@ -1,29 +1,43 @@
-import { useState, useEffect, createContext, useContext } from 'react';
-import { Routes, Route, NavLink } from 'react-router-dom';
-import { onAuthStateChanged, signInWithRedirect, signOut, getRedirectResult } from 'firebase/auth';
-import { auth, googleProvider } from './firebase';
-import Collection from './pages/Collection';
-import Import from './pages/Import';
-import DeckSuggestions from './pages/DeckSuggestions';
+import { useState, useEffect, createContext, useContext } from "react";
+import { Routes, Route, NavLink, useNavigate } from "react-router-dom";
+import { onAuthStateChanged, signInWithRedirect, getRedirectResult, signOut } from "firebase/auth";
+import { auth, googleProvider } from "./firebase";
+import Dashboard from "./pages/Dashboard";
+import Collection from "./pages/Collection";
+import Import from "./pages/Import";
+import DeckSuggestions from "./pages/DeckSuggestions";
+import BrowseCards from "./pages/BrowseCards";
+import BrowseDecks from "./pages/BrowseDecks";
 
 export const AuthContext = createContext(null);
 export const useAuth = () => useContext(AuthContext);
+
+const NAV_LINKS = [
+  { to: "/", label: "Home", end: true },
+  { to: "/collection", label: "My Collection" },
+  { to: "/decks", label: "My Decks" },
+  { to: "/decks/suggest", label: "Deck Suggestions" },
+  { to: "/browse/decks", label: "Browse Decks" },
+  { to: "/browse/cards", label: "Browse Cards" },
+];
 
 export default function App() {
   const [user, setUser] = useState(undefined);
 
   useEffect(() => {
-  getRedirectResult(auth).catch(console.error);
-  const unsub = onAuthStateChanged(auth, (u) => setUser(u || null));
-  return unsub;
-}, []);
+    getRedirectResult(auth).then((result) => {
+      if (result?.user) setUser(result.user);
+    }).catch(console.error);
+    const unsub = onAuthStateChanged(auth, (u) => setUser(u || null));
+    return unsub;
+  }, []);
 
   const login = () => signInWithRedirect(auth, googleProvider);
   const logout = () => signOut(auth);
 
   if (user === undefined) {
     return (
-      <div style={{ display:'flex', alignItems:'center', justifyContent:'center', height:'100vh' }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", height: "100vh" }}>
         <div className="spinner" />
       </div>
     );
@@ -31,14 +45,19 @@ export default function App() {
 
   return (
     <AuthContext.Provider value={{ user, login, logout }}>
-      <div style={{ display:'flex', flexDirection:'column', minHeight:'100vh' }}>
+      <div style={{ display: "flex", flexDirection: "column", minHeight: "100vh" }}>
         <AppNav />
-        <main style={{ flex:1, maxWidth:1200, margin:'0 auto', width:'100%', padding:'32px 24px' }}>
+        <main style={{ flex: 1, maxWidth: 1200, margin: "0 auto", width: "100%", padding: "32px 24px" }}>
           {user ? (
             <Routes>
-              <Route path="/" element={<Collection />} />
+              <Route path="/" element={<Dashboard />} />
+              <Route path="/collection" element={<Collection />} />
+              <Route path="/collection/add" element={<Collection />} />
               <Route path="/import" element={<Import />} />
-              <Route path="/decks" element={<DeckSuggestions />} />
+              <Route path="/decks" element={<MyDecks />} />
+              <Route path="/decks/suggest" element={<DeckSuggestions />} />
+              <Route path="/browse/decks" element={<BrowseDecks />} />
+              <Route path="/browse/cards" element={<BrowseCards />} />
             </Routes>
           ) : (
             <Landing />
@@ -50,69 +69,93 @@ export default function App() {
 }
 
 function AppNav() {
-  const { user, login, logout } = useAuth();
-  const navStyle = {
-    borderBottom:'1px solid var(--border)', background:'var(--bg-card)',
-    padding:'0 24px', display:'flex', alignItems:'center', gap:32,
-    height:64, position:'sticky', top:0, zIndex:100,
-  };
+  const { user, logout } = useAuth();
+
   const linkStyle = (active) => ({
-    padding:'6px 16px', borderRadius:'var(--radius)',
-    fontFamily:'var(--font-display)', fontSize:13, fontWeight:600,
-    letterSpacing:'0.06em', textTransform:'uppercase', textDecoration:'none',
-    color: active ? 'var(--gold-bright)' : 'var(--text-secondary)',
-    background: active ? 'var(--gold-glow)' : 'transparent',
-    border: active ? '1px solid var(--border-gold)' : '1px solid transparent',
-    transition:'all 0.2s',
+    padding: "6px 12px",
+    borderRadius: "var(--radius)",
+    fontFamily: "var(--font-display)",
+    fontSize: 12,
+    fontWeight: 600,
+    letterSpacing: "0.05em",
+    textTransform: "uppercase",
+    textDecoration: "none",
+    color: active ? "var(--gold-bright)" : "var(--text-secondary)",
+    background: active ? "var(--gold-glow)" : "transparent",
+    border: active ? "1px solid var(--border-gold)" : "1px solid transparent",
+    transition: "all 0.2s",
+    whiteSpace: "nowrap",
   });
 
   return (
-    <nav style={navStyle}>
-      <span style={{ fontFamily:'var(--font-display)', fontSize:20, fontWeight:700, color:'var(--gold-bright)', letterSpacing:'0.06em' }}>
+    <nav style={{
+      borderBottom: "1px solid var(--border)",
+      background: "var(--bg-card)",
+      padding: "0 24px",
+      display: "flex",
+      alignItems: "center",
+      height: 60,
+      position: "sticky",
+      top: 0,
+      zIndex: 100,
+      gap: 8,
+    }}>
+      <NavLink to="/" style={{ fontFamily: "var(--font-display)", fontSize: 18, fontWeight: 700, color: "var(--gold-bright)", letterSpacing: "0.08em", textDecoration: "none", marginRight: 16, flexShrink: 0 }}>
         Sleeved
-      </span>
+      </NavLink>
       {user && (
-        <div style={{ display:'flex', gap:4 }}>
-          {[['/', 'Collection'], ['/import', 'Import'], ['/decks', 'Deck Suggestions']].map(([to, label]) => (
-            <NavLink key={to} to={to} end={to==='/'} style={({ isActive }) => linkStyle(isActive)}>{label}</NavLink>
+        <div style={{ display: "flex", gap: 2, overflowX: "auto", flex: 1 }}>
+          {NAV_LINKS.map(({ to, label, end }) => (
+            <NavLink key={to} to={to} end={end} style={({ isActive }) => linkStyle(isActive)}>{label}</NavLink>
           ))}
         </div>
       )}
-      <div style={{ marginLeft:'auto', display:'flex', alignItems:'center', gap:12 }}>
-        {user
-          ? <><span style={{ color:'var(--text-secondary)', fontSize:14 }}>{user.displayName}</span>
-              <button className="btn" onClick={logout}>Sign Out</button></>
-          : <button className="btn btn-primary" onClick={login}>Sign In with Google</button>
-        }
+      <div style={{ marginLeft: "auto", flexShrink: 0 }}>
+        {user && <button className="btn" onClick={logout} style={{ fontSize: 12, padding: "6px 14px" }}>Sign Out</button>}
       </div>
     </nav>
+  );
+}
+
+function MyDecks() {
+  const navigate = useNavigate();
+  return (
+    <div className="fade-in">
+      <h1 className="section-title" style={{ marginBottom: 6 }}>My Decks</h1>
+      <p style={{ color: "var(--text-secondary)", marginBottom: 32 }}>Your saved decks will appear here.</p>
+      <div className="card-panel" style={{ textAlign: "center", padding: 60, color: "var(--text-muted)" }}>
+        <p style={{ fontFamily: "var(--font-display)", fontSize: 18, marginBottom: 12 }}>No decks yet</p>
+        <p style={{ fontSize: 15, marginBottom: 24 }}>Build one from your collection using Deck Suggestions.</p>
+        <button className="btn btn-primary" onClick={() => navigate("/decks/suggest")}>Find Compatible Decks</button>
+      </div>
+    </div>
   );
 }
 
 function Landing() {
   const { login } = useAuth();
   const features = [
-    { icon:'📦', title:'Track Your Collection', desc:'Add cards manually or bulk-import from Moxfield, Archidekt, MTGGoldfish, Manabox, and more.' },
-    { icon:'🔮', title:'Smart Deck Suggestions', desc:'Get AI-powered deck recommendations based on cards you already own, filtered by format and strategy.' },
-    { icon:'⚡', title:'Sync from Any Site', desc:'Paste a decklist, upload a CSV, or import your full collection export in seconds.' },
+    { icon: "📦", title: "Track Your Collection", desc: "Add cards manually or bulk-import from Moxfield, Archidekt, Manabox, and more." },
+    { icon: "🔮", title: "Smart Deck Suggestions", desc: "Get deck recommendations based on cards you already own." },
+    { icon: "⚡", title: "Sync from Any Site", desc: "Paste a decklist or upload a CSV export in seconds." },
   ];
   return (
-    <div style={{ textAlign:'center', paddingTop:80 }} className="fade-in">
-      <h1 style={{ fontFamily:'var(--font-display)', fontSize:48, fontWeight:700, color:'var(--gold-bright)', letterSpacing:'0.05em', marginBottom:16 }}>
+    <div style={{ textAlign: "center", paddingTop: 80 }} className="fade-in">
+      <h1 style={{ fontFamily: "var(--font-display)", fontSize: 52, fontWeight: 700, color: "var(--gold-bright)", letterSpacing: "0.06em", marginBottom: 16 }}>
         Sleeved
       </h1>
-      <p style={{ color:'var(--text-secondary)', fontSize:20, maxWidth:480, margin:'0 auto 40px' }}>
+      <p style={{ color: "var(--text-secondary)", fontSize: 20, maxWidth: 440, margin: "0 auto 40px" }}>
         Track your MTG collection, import cards from any platform, and get intelligent deck suggestions.
       </p>
-      <button className="btn btn-primary" onClick={login} style={{ fontSize:15, padding:'14px 32px', marginBottom:64 }}>
-        Get Started
+      <button className="btn btn-primary" onClick={login} style={{ fontSize: 15, padding: "14px 36px", marginBottom: 64 }}>
+        Sign In with Google
       </button>
-      <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:24, maxWidth:800, margin:'0 auto' }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3,1fr)", gap: 24, maxWidth: 800, margin: "0 auto" }}>
         {features.map(({ icon, title, desc }) => (
-          <div key={title} className="card-panel" style={{ textAlign:'left' }}>
-            <div style={{ fontSize:28, marginBottom:12 }}>{icon}</div>
-            <h3 style={{ fontFamily:'var(--font-display)', fontSize:15, color:'var(--gold-bright)', marginBottom:8 }}>{title}</h3>
-            <p style={{ color:'var(--text-secondary)', fontSize:15, lineHeight:1.5 }}>{desc}</p>
+          <div key={title} className="card-panel" style={{ textAlign: "left" }}>
+            <div style={{ fontSize: 28, marginBottom: 12 }}>{icon}</div>
+            <h3 style={{ fontFamily: "var(--font-display)", fontSize: 14, color: "var(--gold-bright)", marginBottom: 8 }}>{title}</h3>
+            <p style={{ color: "var(--text-secondary)", fontSize: 14, lineHeight: 1.5 }}>{desc}</p>
           </div>
         ))}
       </div>
