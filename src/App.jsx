@@ -1,6 +1,6 @@
 import { useState, useEffect, createContext, useContext } from 'react';
 import { Routes, Route, NavLink } from 'react-router-dom';
-import { onAuthStateChanged, signInWithPopup, signOut } from 'firebase/auth';
+import { onAuthStateChanged, signInWithRedirect, signOut, getRedirectResult } from 'firebase/auth';
 import { auth, googleProvider } from './firebase';
 import Collection from './pages/Collection';
 import Import from './pages/Import';
@@ -13,11 +13,12 @@ export default function App() {
   const [user, setUser] = useState(undefined);
 
   useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (u) => setUser(u || null));
-    return unsub;
-  }, []);
+  getRedirectResult(auth).catch(console.error);
+  const unsub = onAuthStateChanged(auth, (u) => setUser(u || null));
+  return unsub;
+}, []);
 
-  const login = () => signInWithPopup(auth, googleProvider);
+  const login = () => signInWithRedirect(auth, googleProvider);
   const logout = () => signOut(auth);
 
   if (user === undefined) {
