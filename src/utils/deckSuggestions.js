@@ -7,7 +7,7 @@
 //   4. Sort by weighted main score
 
 import { resolveCardNames, getSynergyCards } from './scryfallApi';
-import { scoreDeck, buildDeckProfile, DEFAULT_WEIGHTS } from './deckScoring';
+import { scoreDeck, buildDeckProfile, calculateMainScore, DEFAULT_WEIGHTS } from './deckScoring';
 
 // ---------------------------------------------------------------------------
 // Archetype registry
@@ -330,7 +330,6 @@ export async function generateSuggestions({
  * @returns {Array} Re-sorted suggestions
  */
 export function rescore(suggestions, weights) {
-  const { calculateMainScore } = require('./deckScoring');
   return suggestions
     .map((s) => ({
       ...s,
