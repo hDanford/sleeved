@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../App';
 import { loadCollection, upsertCard, removeCard } from '../utils/collectionStore';
 import { searchCard, searchCards } from '../utils/scryfallApi';
+import { syncCollection, getCollectionMeta } from '../utils/collectionSync';
 
 const CONDITIONS = ['NM', 'LP', 'MP', 'HP', 'DMG'];
 
@@ -16,6 +17,7 @@ export default function Collection() {
   const [filterFoil, setFilterFoil] = useState('');
   const [sortBy, setSortBy] = useState('name');
   const [showAddForm, setShowAddForm] = useState(false);
+  const [showImport, setShowImport] = useState(false);
 
   useEffect(() => {
     loadCollection(user.uid).then((c) => { setCards(c); setLoading(false); });
@@ -40,6 +42,13 @@ export default function Collection() {
     const card = cards.find((c) => c.id === id);
     await upsertCard(user.uid, { ...card, ...updates });
     setCards((prev) => prev.map((c) => c.id === id ? { ...c, ...updates } : c));
+  }
+
+  function handleImportDone() {
+    // Reload collection from Firestore after a successful import
+    setLoading(true);
+    loadCollection(user.uid).then((c) => { setCards(c); setLoading(false); });
+    setShowImport(false);
   }
 
   const filtered = cards
@@ -71,11 +80,25 @@ export default function Collection() {
           <button className="btn" onClick={() => setView(view === 'grid' ? 'list' : 'grid')} style={{ fontSize:12 }}>
             {view === 'grid' ? '☰ List View' : '⊞ Grid View'}
           </button>
-          <button className="btn btn-primary" onClick={() => setShowAddForm(!showAddForm)} style={{ fontSize:12 }}>
+          <button
+            className="btn"
+            onClick={() => { setShowImport(!showImport); setShowAddForm(false); }}
+            style={{ fontSize:12 }}
+          >
+            {showImport ? '✕ Cancel' : '⬆ Import'}
+          </button>
+          <button className="btn btn-primary" onClick={() => { setShowAddForm(!showAddForm); setShowImport(false); }} style={{ fontSize:12 }}>
             {showAddForm ? '✕ Cancel' : '+ Add Card'}
           </button>
         </div>
       </div>
+
+      {showImport && (
+        <div className="card-panel fade-in" style={{ marginBottom:24, border:'1px solid var(--border-gold)' }}>
+          <h2 style={{ fontFamily:'var(--font-display)', fontSize:15, color:'var(--gold-bright)', marginBottom:18 }}>Import Collection</h2>
+          <ImportForm uid={user.uid} onDone={handleImportDone} />
+        </div>
+      )}
 
       {showAddForm && (
         <div className="card-panel fade-in" style={{ marginBottom:24, border:'1px solid var(--border-gold)' }}>
@@ -114,7 +137,10 @@ export default function Collection() {
         <div className="card-panel" style={{ textAlign:'center', padding:60, color:'var(--text-muted)' }}>
           <p style={{ fontFamily:'var(--font-display)', fontSize:20, marginBottom:10 }}>No cards yet</p>
           <p style={{ fontSize:15, marginBottom:24 }}>Add your first card or import your collection.</p>
-          <button className="btn btn-primary" onClick={() => setShowAddForm(true)}>+ Add a Card</button>
+          <div style={{ display:'flex', gap:10, justifyContent:'center' }}>
+            <button className="btn" onClick={() => setShowImport(true)}>⬆ Import Collection</button>
+            <button className="btn btn-primary" onClick={() => setShowAddForm(true)}>+ Add a Card</button>
+          </div>
         </div>
       ) : filtered.length === 0 ? (
         <div className="card-panel" style={{ textAlign:'center', padding:40, color:'var(--text-muted)' }}>
@@ -129,6 +155,175 @@ export default function Collection() {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Import Form
+// ---------------------------------------------------------------------------
+function ImportForm({ uid, onDone }) {
+  const [rawText, setRawText] = useState('');
+  const [mode, setMode] = useState('merge');
+  const [isDragging, setIsDragging] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const [status, setStatus] = useState(null);
+  const [submitting, setSubmitting] = useState(false);
+  const fileInputRef = useRef();
+
+  function readFile(file) {
+    const reader = new FileReader();
+    reader.onload = (e) => { setRawText(e.target.result); setStatus(null); };
+    reader.readAsText(file);
+  }
+
+  function handleDrop(e) {
+    e.preventDefault();
+    setIsDragging(false);
+    const file = e.dataTransfer.files[0];
+    if (file) readFile(file);
+  }
+
+  async function handleSubmit() {
+    if (!rawText.trim()) { setStatus({ type: 'error', message: 'Paste or drop some card data first.' }); return; }
+    setSubmitting(true);
+    setStatus(null);
+    try {
+      const result = await syncCollection({
+        rawText,
+        mode,
+        onProgress: setProgress,
+      });
+      setStatus({
+        type: 'success',
+        message: `${mode === 'merge' ? 'Merged' : 'Replaced'} — ${result.cardCount.toLocaleString()} cards synced from ${result.source}.`,
+      });
+      setTimeout(onDone, 1200);
+    } catch (err) {
+      setStatus({ type: 'error', message: err.message ?? 'Something went wrong.' });
+    } finally {
+      setSubmitting(false);
+      setProgress(null);
+    }
+  }
+
+  return (
+    <div>
+      {/* Source hint */}
+      <p style={{ fontSize:12, color:'var(--text-muted)', marginBottom:14 }}>
+        Supports Moxfield, Archidekt, Manabox, MTGGoldfish CSV exports, or any plain decklist (e.g. <code style={{ color:'var(--gold-bright)' }}>4 Lightning Bolt</code>).
+      </p>
+
+      {/* Merge / Replace toggle */}
+      <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:16 }}>
+        <span style={{ fontSize:13, color:'var(--text-secondary)' }}>Mode:</span>
+        {['merge', 'replace'].map((m) => (
+          <button
+            key={m}
+            onClick={() => setMode(m)}
+            className="btn"
+            style={{
+              fontSize:11,
+              background: mode === m ? (m === 'replace' ? 'rgba(224,80,80,0.15)' : 'rgba(201,168,76,0.15)') : 'transparent',
+              border: `1px solid ${mode === m ? (m === 'replace' ? '#e05050' : 'var(--border-gold)') : 'var(--border)'}`,
+              color: mode === m ? (m === 'replace' ? '#e05050' : 'var(--gold-bright)') : 'var(--text-muted)',
+              textTransform:'capitalize',
+            }}
+          >
+            {m}
+          </button>
+        ))}
+        <span style={{ fontSize:11, color:'var(--text-muted)' }}>
+          {mode === 'merge' ? '— adds to existing quantities' : '— overwrites your entire collection'}
+        </span>
+      </div>
+
+      {/* Drop zone */}
+      <div
+        onDragOver={(e) => { e.preventDefault(); setIsDragging(true); }}
+        onDragLeave={() => setIsDragging(false)}
+        onDrop={handleDrop}
+        onClick={() => fileInputRef.current?.click()}
+        style={{
+          border: `2px dashed ${isDragging ? 'var(--border-gold)' : 'var(--border)'}`,
+          borderRadius: 'var(--radius)',
+          padding: '18px 16px',
+          textAlign: 'center',
+          cursor: 'pointer',
+          background: isDragging ? 'var(--gold-glow)' : 'var(--bg-elevated)',
+          transition: 'all 0.15s',
+          marginBottom: 12,
+        }}
+      >
+        <div style={{ fontSize:22, marginBottom:6 }}>⬆</div>
+        <div style={{ fontSize:13, color:'var(--text-secondary)' }}>
+          Drop a file or <span style={{ color:'var(--gold-bright)', textDecoration:'underline' }}>click to browse</span>
+        </div>
+        <div style={{ fontSize:11, color:'var(--text-muted)', marginTop:3 }}>
+          .csv, .txt, or plain decklist
+        </div>
+        <input
+          ref={fileInputRef}
+          type="file"
+          accept=".csv,.txt,.dec"
+          style={{ display:'none' }}
+          onChange={(e) => { if (e.target.files[0]) readFile(e.target.files[0]); }}
+        />
+      </div>
+
+      {/* Paste area */}
+      <textarea
+        value={rawText}
+        onChange={(e) => { setRawText(e.target.value); setStatus(null); }}
+        placeholder={'Or paste your export here…\n\nExample:\n4 Lightning Bolt\n4 Monastery Swiftspear\n2 Goblin Guide'}
+        rows={7}
+        style={{
+          width:'100%', boxSizing:'border-box',
+          background:'var(--bg-deep)', border:'1px solid var(--border)',
+          borderRadius:'var(--radius)', padding:'10px 12px', fontSize:12,
+          color:'var(--text-secondary)', resize:'vertical', fontFamily:'monospace',
+          lineHeight:1.7,
+        }}
+      />
+
+      {/* Progress bar */}
+      {progress && progress.phase !== 'done' && (
+        <div style={{ marginTop:10 }}>
+          <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}>
+            <span style={{ fontSize:11, color:'var(--text-muted)' }}>
+              {progress.phase === 'parsing' ? 'Parsing…' : 'Syncing to cloud…'}
+            </span>
+            <span style={{ fontSize:11, color:'var(--text-muted)', fontFamily:'monospace' }}>{progress.pct}%</span>
+          </div>
+          <div style={{ height:3, background:'var(--bg-elevated)', borderRadius:2, overflow:'hidden' }}>
+            <div style={{ height:'100%', width:`${progress.pct}%`, background:'var(--gold-bright)', borderRadius:2, transition:'width 0.3s ease' }} />
+          </div>
+        </div>
+      )}
+
+      {/* Status message */}
+      {status && (
+        <p style={{
+          marginTop:10, fontSize:13, padding:'8px 12px', borderRadius:'var(--radius)',
+          background: status.type === 'success' ? 'rgba(34,197,94,0.1)' : 'rgba(224,80,80,0.1)',
+          border: `1px solid ${status.type === 'success' ? 'rgba(34,197,94,0.3)' : 'rgba(224,80,80,0.3)'}`,
+          color: status.type === 'success' ? '#4ade80' : '#e05050',
+        }}>
+          {status.type === 'success' ? '✓ ' : '✕ '}{status.message}
+        </p>
+      )}
+
+      <button
+        className="btn btn-primary"
+        onClick={handleSubmit}
+        disabled={submitting || !rawText.trim()}
+        style={{ marginTop:14 }}
+      >
+        {submitting ? (progress?.phase === 'parsing' ? 'Parsing…' : 'Syncing…') : 'Import Collection'}
+      </button>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Add Card Form (unchanged)
+// ---------------------------------------------------------------------------
 function AddCardForm({ onAdd }) {
   const [name, setName] = useState('');
   const [qty, setQty] = useState(1);
@@ -215,6 +410,9 @@ function AddCardForm({ onAdd }) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// Grid / List views (unchanged)
+// ---------------------------------------------------------------------------
 function GridView({ cards, onRemove, onUpdate }) {
   return (
     <div style={{ display:'grid', gridTemplateColumns:'repeat(auto-fill, minmax(180px,1fr))', gap:16 }}>
