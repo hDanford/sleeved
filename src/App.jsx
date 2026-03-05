@@ -26,7 +26,7 @@ export default function App() {
     return unsub;
   }, []);
 
-  const login = () => signInWithRedirect(auth, googleProvider);
+  const login = () => signInWithPopup(auth, googleProvider).then((result) => setUser(result.user)).catch(console.error);
   const logout = () => signOut(auth);
 
   if (user === undefined) {
