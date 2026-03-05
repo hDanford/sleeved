@@ -185,7 +185,7 @@ function ImportForm({ uid, onDone }) {
     setSubmitting(true);
     setStatus(null);
     try {
-      const result = await syncCollection({
+      const result = await syncCollection({ uid,
         rawText,
         mode,
         onProgress: setProgress,
