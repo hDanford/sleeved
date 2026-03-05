@@ -2,19 +2,34 @@
 // Wrapper for the Scryfall API (free, no key required)
 // Docs: https://scryfall.com/docs/api
 //
-// Card lookups (searchCard, getCardByName, resolveCardNames) check the local
-// IndexedDB bulk data first via bulkDataManager. The live API is only hit when
-// bulk data is not yet available (e.g. first app load before download completes).
+// Card lookups check local IndexedDB bulk data first via bulkDataManager.
+// The live API is only hit when bulk data isn't available yet.
 
 import { lookupCard, lookupCardExact, isBulkReady } from './bulkDataManager';
 
 const BASE = 'https://api.scryfall.com';
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — for live API fallback responses only
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+// ---------------------------------------------------------------------------
+// Memoised bulk-ready check
+// isBulkReady() hits IndexedDB every call — cache the result in memory so
+// we only pay that cost once per session, not once per card lookup.
+// ---------------------------------------------------------------------------
+let _bulkReadyCache = null;
+
+async function bulkReady() {
+  if (_bulkReadyCache !== null) return _bulkReadyCache;
+  _bulkReadyCache = await isBulkReady();
+  return _bulkReadyCache;
+}
+
+/** Call this after initBulkData() completes so the memo is invalidated. */
+export function invalidateBulkReadyCache() {
+  _bulkReadyCache = null;
+}
 
 // ---------------------------------------------------------------------------
 // Live API cache (fallback only)
-// Used when bulk data isn't loaded yet. Keyed by URL.
-// Falls back to in-memory Map if localStorage is unavailable.
 // ---------------------------------------------------------------------------
 const memoryCache = new Map();
 
@@ -45,8 +60,6 @@ function cacheSet(key, value) {
 
 // ---------------------------------------------------------------------------
 // Rate-limit queue (live API fallback only)
-// All live API requests are funnelled through here: 80ms gap between calls.
-// The *.scryfall.io bulk download origin has no rate limit.
 // ---------------------------------------------------------------------------
 let lastRequestAt = 0;
 const RATE_LIMIT_MS = 80;
@@ -73,35 +86,22 @@ async function cachedFetch(url) {
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * searchCard
- * Fuzzy name lookup. Checks bulk data first; falls back to live API.
- */
 export async function searchCard(name) {
-  if (await isBulkReady()) {
+  if (await bulkReady()) {
     const card = await lookupCard(name);
     if (card) return card;
   }
   return cachedFetch(`${BASE}/cards/named?fuzzy=${encodeURIComponent(name)}`);
 }
 
-/**
- * getCardByName
- * Exact name lookup. Checks bulk data first; falls back to live API.
- */
 export async function getCardByName(exactName) {
-  if (await isBulkReady()) {
+  if (await bulkReady()) {
     const card = await lookupCardExact(exactName);
     if (card) return card;
   }
   return cachedFetch(`${BASE}/cards/named?exact=${encodeURIComponent(exactName)}`);
 }
 
-/**
- * searchCards
- * Query-based search. Always uses the live API — bulk data doesn't support
- * arbitrary Scryfall syntax queries locally.
- */
 export async function searchCards(query, page = 1) {
   const data = await cachedFetch(
     `${BASE}/cards/search?q=${encodeURIComponent(query)}&page=${page}`
@@ -111,30 +111,27 @@ export async function searchCards(query, page = 1) {
 
 /**
  * resolveCardNames
- * Batch-resolve a list of card names to full Scryfall card objects.
- * Bulk data path skips the rate limiter entirely — pure local IndexedDB reads.
+ * Bulk path: parallel IndexedDB reads (no rate limit needed).
+ * Live API path: sequential with rate limiting.
  */
 export async function resolveCardNames(names) {
-  const bulk = await isBulkReady();
-  const results = [];
+  const bulk = await bulkReady();
 
+  if (bulk) {
+    // All lookups are local — fire them all in parallel
+    const results = await Promise.all(names.map((name) => lookupCard(name)));
+    return results.filter(Boolean);
+  }
+
+  // Fallback: live API must stay sequential (rate limit)
+  const results = [];
   for (const name of names) {
-    if (bulk) {
-      const card = await lookupCard(name);
-      if (card) { results.push(card); continue; }
-    }
-    // Fallback to live API (rate-limited)
     const card = await cachedFetch(`${BASE}/cards/named?fuzzy=${encodeURIComponent(name)}`);
     if (card) results.push(card);
   }
-
   return results;
 }
 
-/**
- * getSynergyCards
- * Always uses the live API (requires Scryfall query syntax).
- */
 export async function getSynergyCards({ colors, format, strategy, excludeNames = [] }) {
   const colorQuery = colors.length > 0 ? `color<=${colors.join('')}` : '';
   const formatQuery = format ? `legal:${format}` : '';
