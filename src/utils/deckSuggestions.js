@@ -2,14 +2,13 @@
 // Generates a scored, ranked list of deck suggestions.
 //
 // Sources (by format):
-//   commander          → EDHREC (live)
+//   commander               → EDHREC (live)
 //   standard/modern/pioneer → MTGGoldfish proxy (placeholder) + Scryfall archetypes (live fallback)
 //
 // Pipeline:
-//   1. Fetch candidate decks from relevant sources
-//   2. Resolve full card data via scryfallApi (cached + rate-limited)
-//   3. Score each deck via deckScoring
-//   4. Sort by weighted main score
+//   1. Fetch candidates from all sources in parallel
+//   2. Resolve + score all decks in parallel
+//   3. Sort by weighted main score
 
 import { resolveCardNames } from './scryfallApi';
 import { scoreDeck, calculateMainScore, DEFAULT_WEIGHTS } from './deckScoring';
@@ -25,39 +24,29 @@ export { DEFAULT_WEIGHTS };
 
 /**
  * getCandidateDecks
- * Fetches raw (unscored) deck candidates for the given formats.
- *
- * @param {string[]} formats  e.g. ['commander', 'standard', 'modern']
- * @param {number}   countPerFormat  Target deck count per format
- * @returns {Promise<Array>}
+ * Fetches raw (unscored) deck candidates for all formats in parallel.
  */
 export async function getCandidateDecks(formats, countPerFormat = 5) {
-  const allDecks = [];
-
-  for (const format of formats) {
-    if (format === 'commander') {
-      const edhrec = await fetchEDHRECDecks(countPerFormat);
-      allDecks.push(...edhrec);
-      continue;
-    }
-
-    // For 60-card formats: try MTGGoldfish proxy first, fall back to Scryfall archetypes
-    if (isMTGGoldfishAvailable()) {
-      const goldfish = await fetchMTGGoldfishDecks(format, countPerFormat);
-      if (goldfish.length > 0) {
-        allDecks.push(...goldfish);
-        continue;
+  // Fetch all formats simultaneously
+  const perFormat = await Promise.all(
+    formats.map(async (format) => {
+      if (format === 'commander') {
+        return fetchEDHRECDecks(countPerFormat);
       }
-    }
 
-    // MTGGoldfish not yet available — use Scryfall-built archetypes
-    const scryfall = await fetchScryfallArchetypeDecks(format);
-    allDecks.push(...scryfall.slice(0, countPerFormat));
-  }
+      if (isMTGGoldfishAvailable()) {
+        const goldfish = await fetchMTGGoldfishDecks(format, countPerFormat);
+        if (goldfish.length > 0) return goldfish;
+      }
 
-  // Deduplicate by id
+      const scryfall = await fetchScryfallArchetypeDecks(format);
+      return scryfall.slice(0, countPerFormat);
+    })
+  );
+
+  // Flatten and deduplicate by id
   const seen = new Set();
-  return allDecks.filter((d) => {
+  return perFormat.flat().filter((d) => {
     if (seen.has(d.id)) return false;
     seen.add(d.id);
     return true;
@@ -68,6 +57,29 @@ export async function getCandidateDecks(formats, countPerFormat = 5) {
 // Scoring pipeline
 // ---------------------------------------------------------------------------
 
+async function scoreSingleDeck({ deck, userCollection, userDeckProfiles, weights }) {
+  const cardNames = deck.keyCards
+    .filter((c) => c.section !== 'sideboard')
+    .map((c) => c.name);
+
+  const resolvedCards = await resolveCardNames(cardNames);
+
+  const deckList = deck.keyCards.map((c) => ({
+    ...c,
+    section: c.section ?? 'mainboard',
+  }));
+
+  const scored = scoreDeck({
+    deckList,
+    resolvedCards,
+    userCollection,
+    userDeckProfiles,
+    weights,
+  });
+
+  return { ...deck, ...scored, resolvedCards };
+}
+
 /**
  * generateSuggestions
  *
@@ -75,8 +87,8 @@ export async function getCandidateDecks(formats, countPerFormat = 5) {
  * @param {Map}      params.userCollection     Map<cardNameLower, qty>
  * @param {Array}    params.userDeckProfiles   buildDeckProfile() results from existing decks
  * @param {object}   params.weights            Weight overrides
- * @param {string[]} params.formats            Formats to include (default: all four)
- * @param {number}   params.countPerFormat     Candidates per format (default 5)
+ * @param {string[]} params.formats            Formats to include
+ * @param {number}   params.countPerFormat     Candidates per format
  * @param {function} params.onProgress         (current, total) => void
  * @returns {Promise<Array>} Scored and sorted deck suggestions
  */
@@ -88,47 +100,31 @@ export async function generateSuggestions({
   countPerFormat = 5,
   onProgress,
 }) {
-  // 1. Fetch candidates from all sources
+  // 1. Fetch all candidates in parallel
   const candidates = await getCandidateDecks(formats, countPerFormat);
   const total = candidates.length;
-  const results = [];
+  let completed = 0;
 
-  // 2. Resolve + score each deck
-  for (let i = 0; i < candidates.length; i++) {
-    const deck = candidates[i];
-    onProgress?.(i, total);
+  onProgress?.(0, total);
 
-    try {
-      const cardNames = deck.keyCards
-        .filter((c) => c.section !== 'sideboard')
-        .map((c) => c.name);
+  // 2. Score all decks in parallel, reporting progress as each one finishes
+  const settled = await Promise.allSettled(
+    candidates.map((deck) =>
+      scoreSingleDeck({ deck, userCollection, userDeckProfiles, weights }).then((result) => {
+        onProgress?.(++completed, total);
+        return result;
+      })
+    )
+  );
 
-      const resolvedCards = await resolveCardNames(cardNames);
+  const results = settled
+    .filter((s) => s.status === 'fulfilled')
+    .map((s) => s.value);
 
-      const deckList = deck.keyCards.map((c) => ({
-        ...c,
-        section: c.section ?? 'mainboard',
-      }));
-
-      const scored = scoreDeck({
-        deckList,
-        resolvedCards,
-        userCollection,
-        userDeckProfiles,
-        weights,
-      });
-
-      results.push({
-        ...deck,
-        ...scored,
-        resolvedCards,
-      });
-    } catch (err) {
-      console.warn(`[deckSuggestions] Failed to score "${deck.name}":`, err);
-    }
-  }
-
-  onProgress?.(total, total);
+  // Log any failures without crashing
+  settled
+    .filter((s) => s.status === 'rejected')
+    .forEach((s) => console.warn('[deckSuggestions] Scoring failed:', s.reason));
 
   // 3. Sort by mainScore descending
   return results.sort((a, b) => b.mainScore - a.mainScore);
@@ -141,10 +137,6 @@ export async function generateSuggestions({
 /**
  * rescore
  * Re-apply new weights to already-fetched suggestions without hitting any API.
- *
- * @param {Array}  suggestions  Output of generateSuggestions()
- * @param {object} weights      New weight map
- * @returns {Array} Re-sorted suggestions
  */
 export function rescore(suggestions, weights) {
   return suggestions
