@@ -1,5 +1,5 @@
 // src/utils/importParsers.js
-// Parsers for card data from Moxfield, Archidekt, Manabox, MTGGoldfish, and plain decklists
+// Parsers for card data from Moxfield, Archidekt, Manabox, MTGGoldfish, Deckbox, and plain decklists
 
 function parseCSVLine(line) {
   const result = [];
@@ -93,10 +93,58 @@ export function parseManaboxCSV(csvText) {
   }).filter((c) => c.name);
 }
 
+// Deckbox export format
+// Columns: Count, Tradelist Count, Decks Count Built, Decks Count All, Name,
+//          Edition, Edition Code, Card Number, Condition, Language, Foil,
+//          Signed, Artist Proof, Altered Art, Misprint, Promo, Textless,
+//          Printing Id, Printing Note, Tags, My Price, Type, Cost, Rarity,
+//          Price, Image URL, Last Updated, TcgPlayer ID, Scryfall ID
+export function parseDeckboxCSV(csvText) {
+  const lines = csvText.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (lines.length < 2) return [];
+  const header = parseCSVLine(lines[0]).map((h) => h.toLowerCase().trim());
+
+  const countIdx     = header.indexOf('count');
+  const nameIdx      = header.indexOf('name');
+  const setIdx       = header.findIndex((h) => h === 'edition code');
+  const condIdx      = header.indexOf('condition');
+  const foilIdx      = header.indexOf('foil');
+  const scryfallIdx  = header.findIndex((h) => h === 'scryfall id');
+  const langIdx      = header.indexOf('language');
+
+  if (nameIdx === -1) return [];
+
+  // Deckbox condition labels → standard short codes
+  const condMap = {
+    'near mint': 'NM', 'lightly played': 'LP', 'moderately played': 'MP',
+    'heavily played': 'HP', 'damaged': 'DMG',
+    'mint': 'NM', 'excellent': 'LP', 'good': 'MP', 'played': 'HP',
+  };
+
+  return lines.slice(1).map((line) => {
+    const cols = parseCSVLine(line);
+    const rawCond = cols[condIdx]?.toLowerCase().trim() ?? '';
+    const rawFoil = cols[foilIdx]?.trim() ?? '';
+
+    return {
+      quantity:   parseInt(cols[countIdx] || '1', 10),
+      name:       cols[nameIdx]?.trim() || '',
+      set:        setIdx >= 0 ? cols[setIdx]?.toLowerCase().trim() : undefined,
+      condition:  condMap[rawCond] ?? 'NM',
+      foil:       rawFoil === 'foil' || rawFoil === '1' || rawFoil.toLowerCase() === 'true',
+      language:   langIdx >= 0 ? cols[langIdx]?.trim() : 'English',
+      scryfallId: scryfallIdx >= 0 ? cols[scryfallIdx]?.trim() : undefined,
+      section:    'mainboard',
+    };
+  }).filter((c) => c.name);
+}
+
 export function autoParseImport(text) {
   const trimmed = text.trim();
   if (trimmed.includes(',')) {
     const h = trimmed.split('\n')[0].toLowerCase();
+    // Deckbox — must check before Moxfield since both have 'tradelist count'
+    if (h.includes('edition code') && h.includes('scryfall id')) return { source: 'Deckbox', cards: parseDeckboxCSV(trimmed) };
     if (h.includes('tradelist count') || h.includes('purchase price')) return { source: 'Moxfield', cards: parseMoxfieldCSV(trimmed) };
     if (h.includes('categories')) return { source: 'Archidekt', cards: parseArchidektCSV(trimmed) };
     if (h.includes('set code') || h.includes('collector number')) return { source: 'Manabox', cards: parseManaboxCSV(trimmed) };
