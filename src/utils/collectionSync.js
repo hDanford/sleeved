@@ -1,88 +1,21 @@
 // src/utils/collectionSync.js
-// Manages the user's card collection in Firestore.
-//
-// Firestore path: users/{uid}/collection (single document, map of nameLower → qty)
-//
-// Two write modes:
-//   'merge'   — adds imported quantities on top of existing ones (default)
-//   'replace' — overwrites the entire collection with the imported data
+// Parses raw import text and writes cards to Firestore via collectionStore.
+// Uses the same users/{uid}/cards/{cardId} path as the rest of the app.
 
-import {
-  doc,
-  getDoc,
-  setDoc,
-  updateDoc,
-  serverTimestamp,
-} from 'firebase/firestore';
-import { db, auth } from './firebaseConfig';
+import { loadCollection, bulkImport, upsertCard } from './collectionStore';
 import { autoParseImport } from './importParsers';
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function requireUser() {
-  const user = auth.currentUser;
-  if (!user) throw new Error('User must be signed in to sync collection.');
-  return user;
-}
-
-function collectionRef(uid) {
-  return doc(db, 'users', uid, 'data', 'collection');
-}
-
-// ---------------------------------------------------------------------------
-// Read
-// ---------------------------------------------------------------------------
-
-/**
- * getCollection
- * Returns the user's collection as a Map<cardNameLower, quantity>.
- * This is the exact shape the deck scoring pipeline expects.
- *
- * @returns {Promise<Map<string, number>>}
- */
-export async function getCollection() {
-  const user = requireUser();
-  const snap = await getDoc(collectionRef(user.uid));
-  if (!snap.exists()) return new Map();
-
-  const data = snap.data();
-  const map = new Map();
-  for (const [key, val] of Object.entries(data?.cards ?? {})) {
-    map.set(key, typeof val === 'number' ? val : 0);
-  }
-  return map;
-}
-
-/**
- * getCollectionMeta
- * Returns metadata about the last sync (timestamp, card count, source).
- */
-export async function getCollectionMeta() {
-  const user = requireUser();
-  const snap = await getDoc(collectionRef(user.uid));
-  if (!snap.exists()) return null;
-  const { lastSyncedAt, cardCount, source } = snap.data();
-  return { lastSyncedAt: lastSyncedAt?.toDate?.() ?? null, cardCount, source };
-}
-
-// ---------------------------------------------------------------------------
-// Write
-// ---------------------------------------------------------------------------
 
 /**
  * syncCollection
- * Parses raw import text and writes the collection to Firestore.
- *
  * @param {object} params
- * @param {string} params.rawText    Raw paste/file content (any supported format)
+ * @param {string} params.uid       Firebase user uid
+ * @param {string} params.rawText   Raw paste/file content (any supported format)
  * @param {'merge'|'replace'} params.mode
- * @param {function} params.onProgress  ({ phase, pct, cardCount }) => void
- * @returns {Promise<{ cardCount: number, source: string, mode: string }>}
+ * @param {function} params.onProgress  ({ phase, pct }) => void
+ * @returns {Promise<{ cardCount, source, mode }>}
  */
-export async function syncCollection({ rawText, mode = 'merge', onProgress }) {
-  const user = requireUser();
+export async function syncCollection({ uid, rawText, mode = 'merge', onProgress }) {
+  if (!uid) throw new Error('User must be signed in to sync collection.');
 
   onProgress?.({ phase: 'parsing', pct: 10 });
 
@@ -90,74 +23,55 @@ export async function syncCollection({ rawText, mode = 'merge', onProgress }) {
   const { source, cards } = autoParseImport(rawText);
   if (!cards.length) throw new Error('No cards found in the imported data.');
 
-  // Aggregate quantities (same card may appear multiple times in CSV exports)
+  // 2. Aggregate duplicates (same card can appear multiple times in some exports)
   const parsed = new Map();
   for (const card of cards) {
-    const key = card.name.toLowerCase().trim();
-    parsed.set(key, (parsed.get(key) ?? 0) + (card.quantity ?? 1));
+    const key = `${card.name.toLowerCase()}||${(card.set || '').toLowerCase()}||${!!card.foil}`;
+    if (parsed.has(key)) {
+      parsed.get(key).quantity += (card.quantity ?? 1);
+    } else {
+      parsed.set(key, { ...card, quantity: card.quantity ?? 1 });
+    }
   }
+  const dedupedCards = [...parsed.values()];
 
   onProgress?.({ phase: 'syncing', pct: 40 });
 
-  // 2. Merge or replace
-  let finalCards;
-
-  if (mode === 'merge') {
-    // Load existing and add on top
-    const existing = await getCollection();
-    finalCards = new Map(existing);
-    for (const [key, qty] of parsed) {
-      finalCards.set(key, (finalCards.get(key) ?? 0) + qty);
+  // 3. If replace mode, load existing cards and remove ones not in the new import
+  if (mode === 'replace') {
+    const { deleteDoc, doc, collection } = await import('firebase/firestore');
+    const { db } = await import('../firebase');
+    const existing = await loadCollection(uid);
+    const { writeBatch } = await import('firebase/firestore');
+    const batch = writeBatch(db);
+    for (const card of existing) {
+      batch.delete(doc(collection(db, 'users', uid, 'cards'), card.id));
     }
-  } else {
-    // Replace — use parsed data as-is
-    finalCards = parsed;
+    await batch.commit();
   }
 
-  onProgress?.({ phase: 'syncing', pct: 70 });
+  onProgress?.({ phase: 'syncing', pct: 65 });
 
-  // 3. Write to Firestore
-  // Firestore document keys can't contain '/' so names are safe as-is (lowercase)
-  const cardsObj = Object.fromEntries(finalCards);
-  await setDoc(collectionRef(user.uid), {
-    cards: cardsObj,
-    cardCount: finalCards.size,
-    source,
-    mode,
-    lastSyncedAt: serverTimestamp(),
-  });
+  // 4. Write via bulkImport — same path/shape as the rest of the app
+  await bulkImport(uid, dedupedCards);
 
-  onProgress?.({ phase: 'done', pct: 100, cardCount: finalCards.size });
+  onProgress?.({ phase: 'done', pct: 100 });
 
-  return { cardCount: finalCards.size, source, mode };
+  return { cardCount: dedupedCards.length, source, mode };
 }
 
 /**
- * removeFromCollection
- * Removes specific cards or decrements their quantities.
- *
- * @param {Array<{ name: string, quantity?: number }>} cards
- * @param {boolean} removeAll  If true, removes the card entirely regardless of quantity
+ * getCollectionMeta
+ * Returns a lightweight summary from the live collection.
  */
-export async function removeFromCollection(cards, removeAll = false) {
-  const user = requireUser();
-  const existing = await getCollection();
-
-  for (const { name, quantity = 1 } of cards) {
-    const key = name.toLowerCase().trim();
-    if (!existing.has(key)) continue;
-    if (removeAll) {
-      existing.delete(key);
-    } else {
-      const newQty = (existing.get(key) ?? 0) - quantity;
-      if (newQty <= 0) existing.delete(key);
-      else existing.set(key, newQty);
-    }
+export async function getCollectionMeta(uid) {
+  if (!uid) return null;
+  try {
+    const cards = await loadCollection(uid);
+    if (!cards.length) return null;
+    const cardCount = cards.reduce((sum, c) => sum + (c.quantity ?? 1), 0);
+    return { cardCount, lastSyncedAt: Math.max(...cards.map((c) => c.updatedAt ?? 0)) };
+  } catch {
+    return null;
   }
-
-  await updateDoc(collectionRef(user.uid), {
-    cards: Object.fromEntries(existing),
-    cardCount: existing.size,
-    lastSyncedAt: serverTimestamp(),
-  });
 }
