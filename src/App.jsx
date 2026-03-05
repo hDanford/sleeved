@@ -1,6 +1,6 @@
 import { useState, useEffect, createContext, useContext } from 'react';
 import { Routes, Route, NavLink, useNavigate } from 'react-router-dom';
-import { onAuthStateChanged, signInWithRedirect, getRedirectResult, signOut } from 'firebase/auth';
+import { onAuthStateChanged, signInWithPopup, signOut, getRedirectResult } from 'firebase/auth';
 import { auth, googleProvider } from './firebase';
 import Dashboard from './pages/Dashboard';
 import Collection from './pages/Collection';
