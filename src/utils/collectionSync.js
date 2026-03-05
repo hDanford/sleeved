@@ -1,6 +1,7 @@
 // src/utils/collectionSync.js
 // Parses raw import text and writes cards to Firestore via collectionStore.
 // Uses the same users/{uid}/cards/{cardId} path as the rest of the app.
+// comment to update
 
 import { loadCollection, bulkImport, upsertCard } from './collectionStore';
 import { autoParseImport } from './importParsers';
