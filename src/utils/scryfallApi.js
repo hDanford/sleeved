@@ -1,19 +1,24 @@
 // src/utils/scryfallApi.js
 // Wrapper for the Scryfall API (free, no key required)
 // Docs: https://scryfall.com/docs/api
+//
+// Card lookups (searchCard, getCardByName, resolveCardNames) check the local
+// IndexedDB bulk data first via bulkDataManager. The live API is only hit when
+// bulk data is not yet available (e.g. first app load before download completes).
+
+import { lookupCard, lookupCardExact, isBulkReady } from './bulkDataManager';
 
 const BASE = 'https://api.scryfall.com';
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours — for live API fallback responses only
 
 // ---------------------------------------------------------------------------
-// Cache
-// Keyed by a string (e.g. card name or full URL). Stores { value, expiresAt }.
-// Falls back to a plain in-memory Map if localStorage is unavailable.
+// Live API cache (fallback only)
+// Used when bulk data isn't loaded yet. Keyed by URL.
+// Falls back to in-memory Map if localStorage is unavailable.
 // ---------------------------------------------------------------------------
 const memoryCache = new Map();
 
 function cacheGet(key) {
-  // Try localStorage first
   try {
     const raw = localStorage.getItem(`scryfall:${key}`);
     if (raw) {
@@ -22,7 +27,6 @@ function cacheGet(key) {
       localStorage.removeItem(`scryfall:${key}`);
     }
   } catch {
-    // localStorage unavailable — fall through to memory cache
     const entry = memoryCache.get(key);
     if (entry && Date.now() < entry.expiresAt) return entry.value;
     if (entry) memoryCache.delete(key);
@@ -40,9 +44,9 @@ function cacheSet(key, value) {
 }
 
 // ---------------------------------------------------------------------------
-// Rate-limit queue
-// All requests are funnelled through here to enforce a minimum 80ms gap
-// between calls, satisfying Scryfall's 50–100ms guidance globally.
+// Rate-limit queue (live API fallback only)
+// All live API requests are funnelled through here: 80ms gap between calls.
+// The *.scryfall.io bulk download origin has no rate limit.
 // ---------------------------------------------------------------------------
 let lastRequestAt = 0;
 const RATE_LIMIT_MS = 80;
@@ -55,16 +59,11 @@ async function rateLimitedFetch(url) {
   return fetch(url);
 }
 
-// ---------------------------------------------------------------------------
-// API helpers
-// ---------------------------------------------------------------------------
 async function cachedFetch(url) {
   const cached = cacheGet(url);
   if (cached !== null) return cached;
-
   const res = await rateLimitedFetch(url);
   if (!res.ok) return null;
-
   const data = await res.json();
   cacheSet(url, data);
   return data;
@@ -73,10 +72,36 @@ async function cachedFetch(url) {
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+
+/**
+ * searchCard
+ * Fuzzy name lookup. Checks bulk data first; falls back to live API.
+ */
 export async function searchCard(name) {
+  if (await isBulkReady()) {
+    const card = await lookupCard(name);
+    if (card) return card;
+  }
   return cachedFetch(`${BASE}/cards/named?fuzzy=${encodeURIComponent(name)}`);
 }
 
+/**
+ * getCardByName
+ * Exact name lookup. Checks bulk data first; falls back to live API.
+ */
+export async function getCardByName(exactName) {
+  if (await isBulkReady()) {
+    const card = await lookupCardExact(exactName);
+    if (card) return card;
+  }
+  return cachedFetch(`${BASE}/cards/named?exact=${encodeURIComponent(exactName)}`);
+}
+
+/**
+ * searchCards
+ * Query-based search. Always uses the live API — bulk data doesn't support
+ * arbitrary Scryfall syntax queries locally.
+ */
 export async function searchCards(query, page = 1) {
   const data = await cachedFetch(
     `${BASE}/cards/search?q=${encodeURIComponent(query)}&page=${page}`
@@ -84,22 +109,32 @@ export async function searchCards(query, page = 1) {
   return data ?? { data: [], has_more: false, total_cards: 0 };
 }
 
-export async function getCardByName(exactName) {
-  return cachedFetch(`${BASE}/cards/named?exact=${encodeURIComponent(exactName)}`);
-}
-
-// Batch-resolve a list of card names into full card objects.
-// Rate limiting is handled globally by rateLimitedFetch — no extra delay needed here.
+/**
+ * resolveCardNames
+ * Batch-resolve a list of card names to full Scryfall card objects.
+ * Bulk data path skips the rate limiter entirely — pure local IndexedDB reads.
+ */
 export async function resolveCardNames(names) {
+  const bulk = await isBulkReady();
   const results = [];
+
   for (const name of names) {
-    const card = await searchCard(name);
+    if (bulk) {
+      const card = await lookupCard(name);
+      if (card) { results.push(card); continue; }
+    }
+    // Fallback to live API (rate-limited)
+    const card = await cachedFetch(`${BASE}/cards/named?fuzzy=${encodeURIComponent(name)}`);
     if (card) results.push(card);
   }
+
   return results;
 }
 
-// Get cards that synergize with a given color identity and format
+/**
+ * getSynergyCards
+ * Always uses the live API (requires Scryfall query syntax).
+ */
 export async function getSynergyCards({ colors, format, strategy, excludeNames = [] }) {
   const colorQuery = colors.length > 0 ? `color<=${colors.join('')}` : '';
   const formatQuery = format ? `legal:${format}` : '';
@@ -109,17 +144,16 @@ export async function getSynergyCards({ colors, format, strategy, excludeNames =
   else if (strategy === 'ramp') strategyQuery = '(o:add OR t:land o:search)';
   else if (strategy === 'midrange') strategyQuery = '(t:creature cmc>=3 cmc<=5)';
   const parts = [colorQuery, formatQuery, strategyQuery, '-is:digital', '-t:basic'].filter(Boolean);
-  const query = parts.join(' ');
   try {
-    const data = await searchCards(query);
-    return (data.data || []).filter((c) => !excludeNames.includes(c.name));
+    const data = await searchCards(parts.join(' '));
+    return (data.data ?? []).filter((c) => !excludeNames.includes(c.name));
   } catch {
     return [];
   }
 }
 
 // ---------------------------------------------------------------------------
-// Display helpers (unchanged)
+// Display helpers
 // ---------------------------------------------------------------------------
 export function getColorSymbol(color) {
   const map = { W: '☀', U: '💧', B: '💀', R: '🔥', G: '🌿' };
