@@ -4,15 +4,26 @@
 // No auth required. CORS-friendly for browser use.
 
 const EDHREC_BASE = 'https://json.edhrec.com';
+const FETCH_TIMEOUT_MS = 6000; // give up on a single EDHREC request after 6s
 
-// Cache fetched EDHREC pages for the session (separate from scryfallApi cache
-// since these are larger payloads and change less frequently).
 const pageCache = new Map();
+
+/** Fetch with a timeout so a stalled request doesn't hang forever. */
+async function fetchWithTimeout(url, ms = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 async function fetchEDHRECPage(path) {
   if (pageCache.has(path)) return pageCache.get(path);
   try {
-    const res = await fetch(`${EDHREC_BASE}${path}`);
+    const res = await fetchWithTimeout(`${EDHREC_BASE}${path}`);
     if (!res.ok) return null;
     const data = await res.json();
     pageCache.set(path, data);
@@ -25,8 +36,6 @@ async function fetchEDHRECPage(path) {
 /**
  * getTopCommanders
  * Returns a list of popular commanders from EDHREC's top commanders page.
- * @param {number} limit  How many commanders to return (default 20)
- * @returns {Promise<Array<{ name, slug, colorIdentity, salt, rank }>>}
  */
 export async function getTopCommanders(limit = 20) {
   const data = await fetchEDHRECPage('/pages/commanders.json');
@@ -56,10 +65,6 @@ export async function getTopCommanders(limit = 20) {
 /**
  * getCommanderDeck
  * Fetches the recommended decklist for a specific commander by slug.
- * Returns cards as { name, quantity, section } — compatible with scoreDeck().
- *
- * @param {string} slug  e.g. "atraxa-praetors-voice"
- * @returns {Promise<{ deckList, colors, description } | null>}
  */
 export async function getCommanderDeck(slug) {
   const data = await fetchEDHRECPage(`/pages/commanders/${slug}.json`);
@@ -70,22 +75,20 @@ export async function getCommanderDeck(slug) {
 
   const deckList = [];
 
-  // EDHREC returns card recommendations grouped in cardlists
   for (const list of dict?.cardlists ?? []) {
     const section = (list?.tag ?? '').toLowerCase().includes('land') ? 'land' : 'mainboard';
     for (const card of list?.cardviews ?? []) {
       if (!card?.name) continue;
       deckList.push({
         name: card.name,
-        quantity: 1, // Commander decks are 1-of (except basic lands)
+        quantity: 1,
         section,
-        inclusion: card.inclusion ?? 0,    // % of decks that include this card
-        synergy: card.synergy ?? 0,        // EDHREC synergy score
+        inclusion: card.inclusion ?? 0,
+        synergy: card.synergy ?? 0,
       });
     }
   }
 
-  // Add the commander itself
   const commanderName = dict?.card?.name;
   if (commanderName) {
     deckList.unshift({ name: commanderName, quantity: 1, section: 'commander' });
@@ -99,20 +102,24 @@ export async function getCommanderDeck(slug) {
 
 /**
  * fetchEDHRECDecks
- * Top-level function used by deckSuggestions.js.
- * Returns an array of deck objects ready for scoring.
- *
- * @param {number} count  Number of commander decks to return
- * @returns {Promise<Array>}
+ * Fetches all commander deck pages in parallel with Promise.allSettled
+ * so a single failing/slow page doesn't block the rest.
  */
 export async function fetchEDHRECDecks(count = 10) {
   const commanders = await getTopCommanders(count);
   if (!commanders.length) return [];
 
-  const decks = [];
+  // Fetch all commander pages in parallel
+  const settled = await Promise.allSettled(
+    commanders.map((commander) =>
+      getCommanderDeck(commander.slug).then((result) => ({ commander, result }))
+    )
+  );
 
-  for (const commander of commanders) {
-    const result = await getCommanderDeck(commander.slug);
+  const decks = [];
+  for (const outcome of settled) {
+    if (outcome.status !== 'fulfilled') continue;
+    const { commander, result } = outcome.value;
     if (!result) continue;
 
     decks.push({
@@ -130,7 +137,6 @@ export async function fetchEDHRECDecks(count = 10) {
   return decks;
 }
 
-/** Very rough strategy tag based on color identity. */
 function inferStrategy(colors) {
   if (!colors?.length) return 'midrange';
   if (colors.includes('R') && !colors.includes('U') && !colors.includes('B')) return 'aggro';
