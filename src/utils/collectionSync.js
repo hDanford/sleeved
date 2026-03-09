@@ -3,27 +3,17 @@
 
 import { loadCollection, bulkImport } from './collectionStore';
 import { autoParseImport } from './importParsers';
-import { initBulkData, lookupCard, isBulkReady } from './bulkDataManager';
+import { initScryfallCache, lookupCard, isCacheReady } from './scryfallCache';
 
-/**
- * syncCollection
- * @param {object} params
- * @param {string} params.uid       Firebase user uid
- * @param {string} params.rawText   Raw paste/file content (any supported format)
- * @param {'merge'|'replace'} params.mode
- * @param {function} params.onProgress  ({ phase, pct, label? }) => void
- * @returns {Promise<{ cardCount, source, mode }>}
- */
 export async function syncCollection({ uid, rawText, mode = 'merge', onProgress }) {
   if (!uid) throw new Error('User must be signed in to sync collection.');
 
   onProgress?.({ phase: 'parsing', pct: 5, label: 'Parsing cards…' });
 
-  // 1. Parse the raw input
   const { source, cards } = autoParseImport(rawText);
   if (!cards.length) throw new Error('No cards found in the imported data.');
 
-  // 2. Aggregate duplicates
+  // Deduplicate
   const parsed = new Map();
   for (const card of cards) {
     const key = `${card.name.toLowerCase()}||${(card.set || '').toLowerCase()}||${!!card.foil}`;
@@ -35,34 +25,26 @@ export async function syncCollection({ uid, rawText, mode = 'merge', onProgress 
   }
   const dedupedCards = [...parsed.values()];
 
-  // 3. Ensure Scryfall bulk data is available for image enrichment
-  onProgress?.({ phase: 'bulk', pct: 10, label: 'Checking card image database…' });
-  let bulkAvailable = false;
+  // Ensure card image cache is ready (fetches from Firebase Storage if stale)
+  onProgress?.({ phase: 'cache', pct: 10, label: 'Checking card image database…' });
+  let cacheAvailable = false;
   try {
-    await initBulkData((progress) => {
-      if (progress.phase === 'download') {
-        onProgress?.({
-          phase: 'bulk_download',
-          pct: Math.round(10 + progress.pct * 0.35),
-          label: `Downloading card database… ${progress.pct}%`,
-        });
-      } else if (progress.phase === 'index') {
-        onProgress?.({
-          phase: 'bulk_index',
-          pct: Math.round(45 + progress.pct * 0.15),
-          label: `Indexing cards… ${progress.pct}%`,
-        });
-      } else if (progress.phase === 'ready') {
-        onProgress?.({ phase: 'bulk_ready', pct: 60, label: 'Card database ready.' });
+    await initScryfallCache((p) => {
+      if (p.phase === 'download') {
+        onProgress?.({ phase: 'cache_download', pct: Math.round(10 + p.pct * 0.3), label: `Downloading card database… ${p.pct}%` });
+      } else if (p.phase === 'index') {
+        onProgress?.({ phase: 'cache_index', pct: Math.round(40 + (p.pct - 50) * 0.3), label: `Indexing cards… ${p.pct}%` });
+      } else if (p.phase === 'ready') {
+        onProgress?.({ phase: 'cache_ready', pct: 60, label: 'Card database ready.' });
       }
     });
-    bulkAvailable = true;
+    cacheAvailable = true;
   } catch (e) {
-    console.warn('[syncCollection] Bulk data unavailable, images may be missing:', e.message);
+    console.warn('[syncCollection] Card cache unavailable, images may be missing:', e.message);
   }
 
-  // 4. Enrich cards with Scryfall data (images, colors, type, cmc)
-  if (bulkAvailable) {
+  // Enrich with images
+  if (cacheAvailable) {
     onProgress?.({ phase: 'enriching', pct: 62, label: `Looking up images for ${dedupedCards.length} cards…` });
     for (let i = 0; i < dedupedCards.length; i++) {
       const card = dedupedCards[i];
@@ -71,51 +53,38 @@ export async function syncCollection({ uid, rawText, mode = 'merge', onProgress 
         if (sf) {
           dedupedCards[i] = {
             ...card,
-            colors: sf.colors?.length ? sf.colors : (sf.color_identity || card.colors || []),
-            type: sf.type_line || card.type || null,
-            cmc: sf.cmc ?? card.cmc ?? null,
-            imageUri: sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal || null,
-            imageUriSmall: sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null,
+            colors:        sf.colors?.length ? sf.colors : (sf.color_identity || card.colors || []),
+            type:          sf.type_line   || card.type || null,
+            cmc:           sf.cmc         ?? card.cmc  ?? null,
+            imageUri:      sf.image_normal ?? null,
+            imageUriSmall: sf.image_small  ?? null,
           };
         }
-      } catch { /* skip enrichment for this card */ }
+      } catch { /* skip */ }
       if (i % 50 === 0) {
-        onProgress?.({
-          phase: 'enriching',
-          pct: Math.round(62 + (i / dedupedCards.length) * 18),
-          label: `Looking up images… ${i + 1}/${dedupedCards.length}`,
-        });
+        onProgress?.({ phase: 'enriching', pct: Math.round(62 + (i / dedupedCards.length) * 18), label: `Looking up images… ${i + 1}/${dedupedCards.length}` });
       }
     }
   }
 
   onProgress?.({ phase: 'syncing', pct: 80, label: 'Saving to cloud…' });
 
-  // 5. If replace mode, wipe existing cards first
   if (mode === 'replace') {
-    const { deleteDoc, doc, collection, writeBatch } = await import('firebase/firestore');
+    const { doc, collection, writeBatch } = await import('firebase/firestore');
     const { db } = await import('../firebase');
     const existing = await loadCollection(uid);
     const batch = writeBatch(db);
-    for (const card of existing) {
-      batch.delete(doc(collection(db, 'users', uid, 'cards'), card.id));
-    }
+    for (const card of existing) batch.delete(doc(collection(db, 'users', uid, 'cards'), card.id));
     await batch.commit();
   }
 
   onProgress?.({ phase: 'syncing', pct: 90, label: 'Saving to cloud…' });
-
-  // 6. Write via bulkImport
   await bulkImport(uid, dedupedCards);
-
   onProgress?.({ phase: 'done', pct: 100 });
 
   return { cardCount: dedupedCards.length, source, mode };
 }
 
-/**
- * getCollectionMeta
- */
 export async function getCollectionMeta(uid) {
   if (!uid) return null;
   try {
@@ -130,15 +99,24 @@ export async function getCollectionMeta(uid) {
 
 /**
  * enrichMissingImages
- * Backfills imageUri for cards already in Firestore that are missing images.
- * Only runs if bulk data is already downloaded (won't trigger a new download).
+ * Backfills imageUri for cards in Firestore that have no image.
+ * Triggers a cache download if needed.
  */
-export async function enrichMissingImages(uid, cards, onUpdate) {
+export async function enrichMissingImages(uid, cards, onUpdate, onStatus) {
   const missing = cards.filter((c) => !c.imageUri);
   if (!missing.length) return;
 
-  const ready = await isBulkReady();
-  if (!ready) return;
+  try {
+    onStatus?.('downloading');
+    await initScryfallCache((p) => {
+      if (p.phase === 'ready') onStatus?.('enriching');
+    });
+    onStatus?.('enriching');
+  } catch (e) {
+    console.warn('[enrichMissingImages] Cache init failed:', e.message);
+    onStatus?.(null);
+    return;
+  }
 
   const { upsertCard } = await import('./collectionStore');
   const enriched = [];
@@ -146,17 +124,14 @@ export async function enrichMissingImages(uid, cards, onUpdate) {
   for (const card of missing) {
     try {
       const sf = await lookupCard(card.name);
-      if (!sf) continue;
-      const imageUri = sf.image_uris?.normal || sf.card_faces?.[0]?.image_uris?.normal || null;
-      const imageUriSmall = sf.image_uris?.small || sf.card_faces?.[0]?.image_uris?.small || null;
-      if (!imageUri) continue;
+      if (!sf?.image_normal) continue;
       const updated = {
         ...card,
-        imageUri,
-        imageUriSmall,
-        colors: card.colors?.length ? card.colors : (sf.colors?.length ? sf.colors : (sf.color_identity || [])),
-        type: card.type || sf.type_line || null,
-        cmc: card.cmc ?? sf.cmc ?? null,
+        imageUri:      sf.image_normal,
+        imageUriSmall: sf.image_small  ?? null,
+        colors:        card.colors?.length ? card.colors : (sf.colors?.length ? sf.colors : (sf.color_identity || [])),
+        type:          card.type  || sf.type_line || null,
+        cmc:           card.cmc   ?? sf.cmc       ?? null,
       };
       await upsertCard(uid, updated);
       enriched.push(updated);
@@ -164,11 +139,8 @@ export async function enrichMissingImages(uid, cards, onUpdate) {
   }
 
   if (enriched.length > 0) {
-    onUpdate(
-      cards.map((c) => {
-        const patch = enriched.find((e) => e.id === c.id);
-        return patch || c;
-      })
-    );
+    onUpdate(cards.map((c) => enriched.find((e) => e.id === c.id) || c));
   }
+
+  onStatus?.('done');
 }
