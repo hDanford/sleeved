@@ -3,7 +3,6 @@ import { useAuth } from '../App';
 import { loadCollection, upsertCard, removeCard } from '../utils/collectionStore';
 import { searchCard, searchCards } from '../utils/scryfallApi';
 import { syncCollection, getCollectionMeta, enrichMissingImages } from '../utils/collectionSync';
-import { initBulkData } from '../utils/bulkDataManager';
 
 const CONDITIONS = ['NM', 'LP', 'MP', 'HP', 'DMG'];
 
@@ -26,26 +25,11 @@ export default function Collection() {
     loadCollection(user.uid).then((c) => { setCards(c); setLoading(false); });
   }, [user.uid]);
 
-  // Backfill images for existing cards. If bulk data isn't cached yet, download it first.
+  // Backfill images for existing cards — downloads from Firebase Storage if cache is stale
   useEffect(() => {
     if (loading || !cards.length) return;
-    const hasMissing = cards.some((c) => !c.imageUri);
-    if (!hasMissing) return;
-
-    (async () => {
-      try {
-        setBackfillStatus('downloading');
-        await initBulkData((p) => {
-          if (p.phase === 'ready') setBackfillStatus('enriching');
-        });
-        setBackfillStatus('enriching');
-        await enrichMissingImages(user.uid, cards, setCards);
-        setBackfillStatus('done');
-      } catch (e) {
-        console.warn('[Collection] Image backfill failed:', e.message);
-        setBackfillStatus(null);
-      }
-    })();
+    if (!cards.some((c) => !c.imageUri)) return;
+    enrichMissingImages(user.uid, cards, setCards, setBackfillStatus);
   }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
   async function handleAdd(cardData) {
     const id = await upsertCard(user.uid, cardData);
