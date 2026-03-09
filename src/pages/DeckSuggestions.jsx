@@ -363,12 +363,18 @@ function WeightSlider({ metaKey, value, onChange }) {
 // ---------------------------------------------------------------------------
 // Main page
 // ---------------------------------------------------------------------------
+const ALL_FORMATS = ['commander', 'standard', 'modern', 'pioneer'];
+const ALL_COLORS  = ['W', 'U', 'B', 'R', 'G'];
+const COLOR_META  = { W: { emoji: '☀', label: 'White' }, U: { emoji: '💧', label: 'Blue' }, B: { emoji: '💀', label: 'Black' }, R: { emoji: '🔥', label: 'Red' }, G: { emoji: '🌿', label: 'Green' } };
+
 export default function DeckSuggestions() {
   const { user } = useAuth();
   const [userCollection, setUserCollection] = useState(new Map());
   const [suggestions, setSuggestions] = useState([]);
   const [displayedSuggestions, setDisplayedSuggestions] = useState([]);
   const [weights, setWeights] = useState({ ...DEFAULT_WEIGHTS });
+  const [selectedFormats, setSelectedFormats] = useState([...ALL_FORMATS]);
+  const [colorFilter, setColorFilter] = useState([]); // empty = no filter
   const [loading, setLoading] = useState(false);
   const [progress, setProgress] = useState({ current: 0, total: 0 });
   const [expandedId, setExpandedId] = useState(null);
@@ -385,7 +391,7 @@ export default function DeckSuggestions() {
   }, [user]);
 
   const fetchSuggestions = useCallback(async () => {
-    if (loading) return;
+    if (loading || !selectedFormats.length) return;
     setLoading(true);
     setError(null);
     try {
@@ -393,26 +399,48 @@ export default function DeckSuggestions() {
         userCollection,
         userDeckProfiles: [],
         weights,
+        formats: selectedFormats,
         onProgress: (current, total) => setProgress({ current, total }),
       });
       setSuggestions(results);
-      setDisplayedSuggestions(results);
     } catch (e) {
       setError('Failed to generate suggestions. Please try again.');
       console.error(e);
     } finally {
       setLoading(false);
     }
-  }, [userCollection]); // eslint-disable-line
+  }, [userCollection, selectedFormats]); // eslint-disable-line
 
+  // Refetch when collection loads or formats change
   useEffect(() => {
     if (userCollection.size > 0) fetchSuggestions();
-  }, [userCollection]); // eslint-disable-line
+  }, [userCollection, selectedFormats]); // eslint-disable-line
 
+  // Re-score + re-filter when weights or color filter change
   useEffect(() => {
     if (!suggestions.length) return;
-    setDisplayedSuggestions(rescore(suggestions, weights));
-  }, [weights, suggestions]);
+    let filtered = rescore(suggestions, weights);
+    // Color filter: show decks whose colors are a subset of the selected colors
+    // e.g. pick G+W → show mono-G, mono-W, and G/W decks but not G/W/U
+    if (colorFilter.length > 0) {
+      filtered = filtered.filter((d) =>
+        d.colors.length > 0 && d.colors.every((c) => colorFilter.includes(c))
+      );
+    }
+    setDisplayedSuggestions(filtered);
+  }, [weights, suggestions, colorFilter]);
+
+  const toggleFormat = (fmt) => {
+    setSelectedFormats((prev) =>
+      prev.includes(fmt) ? prev.filter((f) => f !== fmt) : [...prev, fmt]
+    );
+  };
+
+  const toggleColor = (c) => {
+    setColorFilter((prev) =>
+      prev.includes(c) ? prev.filter((x) => x !== c) : [...prev, c]
+    );
+  };
 
   const resetWeights = () => setWeights({ ...DEFAULT_WEIGHTS });
 
@@ -431,10 +459,83 @@ export default function DeckSuggestions() {
 
       {/* Sidebar */}
       <aside style={{ background: '#111320', border: '1px solid #1e2030', borderRadius: 14, padding: 20, height: 'fit-content', position: 'sticky', top: 20 }}>
-        <div style={{ marginBottom: 18 }}>
-          <h2 style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0', margin: 0, letterSpacing: 1, textTransform: 'uppercase' }}>Score Weights</h2>
-          <p style={{ fontSize: 11, color: '#475569', margin: '5px 0 0' }}>Drag to adjust what matters most to you</p>
+
+        {/* Format filter */}
+        <div style={{ marginBottom: 20 }}>
+          <h2 style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0', margin: '0 0 10px', letterSpacing: 1, textTransform: 'uppercase' }}>Format</h2>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {ALL_FORMATS.map((fmt) => {
+              const active = selectedFormats.includes(fmt);
+              return (
+                <button key={fmt} onClick={() => toggleFormat(fmt)} style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  background: active ? 'rgba(37,99,235,0.12)' : 'transparent',
+                  border: `1px solid ${active ? 'rgba(37,99,235,0.4)' : '#1e2030'}`,
+                  borderRadius: 7, padding: '6px 10px', cursor: 'pointer',
+                  color: active ? '#93c5fd' : '#475569',
+                  fontSize: 12, fontWeight: active ? 600 : 400, textAlign: 'left',
+                  textTransform: 'capitalize', transition: 'all 0.15s',
+                }}>
+                  <span style={{
+                    width: 14, height: 14, borderRadius: 3, flexShrink: 0,
+                    background: active ? '#2563eb' : '#1e2030',
+                    border: `1px solid ${active ? '#3b82f6' : '#334155'}`,
+                    display: 'flex', alignItems: 'center', justifyContent: 'center',
+                    fontSize: 9, color: '#fff',
+                  }}>{active ? '✓' : ''}</span>
+                  {fmt}
+                </button>
+              );
+            })}
+          </div>
+          {selectedFormats.length === 0 && (
+            <p style={{ fontSize: 11, color: '#ef4444', margin: '6px 0 0' }}>Select at least one format.</p>
+          )}
         </div>
+
+        {/* Color filter */}
+        <div style={{ marginBottom: 20, paddingTop: 16, borderTop: '1px solid #1e2030' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 10 }}>
+            <h2 style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0', margin: 0, letterSpacing: 1, textTransform: 'uppercase' }}>Colors</h2>
+            {colorFilter.length > 0 && (
+              <button onClick={() => setColorFilter([])} style={{ fontSize: 10, color: '#475569', background: 'none', border: 'none', cursor: 'pointer', padding: 0 }}>
+                Clear
+              </button>
+            )}
+          </div>
+          <p style={{ fontSize: 11, color: '#475569', margin: '0 0 10px' }}>
+            Show decks using only these colors
+          </p>
+          <div style={{ display: 'flex', gap: 6 }}>
+            {ALL_COLORS.map((c) => {
+              const active = colorFilter.includes(c);
+              return (
+                <button key={c} onClick={() => toggleColor(c)} title={COLOR_META[c].label} style={{
+                  width: 36, height: 36, borderRadius: 8, cursor: 'pointer',
+                  border: `2px solid ${active ? '#c9a84c' : '#1e2030'}`,
+                  background: active ? 'rgba(201,168,76,0.15)' : '#0f1020',
+                  fontSize: 16, transition: 'all 0.15s',
+                  transform: active ? 'scale(1.1)' : 'scale(1)',
+                  boxShadow: active ? '0 0 8px rgba(201,168,76,0.3)' : 'none',
+                }}>
+                  {COLOR_META[c].emoji}
+                </button>
+              );
+            })}
+          </div>
+          {colorFilter.length > 0 && (
+            <p style={{ fontSize: 11, color: '#64748b', margin: '8px 0 0' }}>
+              Showing decks in {colorFilter.map((c) => COLOR_META[c].label).join(' + ')} only
+            </p>
+          )}
+        </div>
+
+        {/* Score weights */}
+        <div style={{ paddingTop: 16, borderTop: '1px solid #1e2030' }}>
+          <div style={{ marginBottom: 18 }}>
+            <h2 style={{ fontSize: 13, fontWeight: 700, color: '#e2e8f0', margin: 0, letterSpacing: 1, textTransform: 'uppercase' }}>Score Weights</h2>
+            <p style={{ fontSize: 11, color: '#475569', margin: '5px 0 0' }}>Drag to adjust what matters most to you</p>
+          </div>
         {Object.keys(DEFAULT_WEIGHTS).map((key) => (
           <WeightSlider key={key} metaKey={key} value={weights[key]} onChange={(v) => setWeights((p) => ({ ...p, [key]: v }))} />
         ))}
@@ -447,7 +548,7 @@ export default function DeckSuggestions() {
           <div style={{ fontSize: 11, color: '#475569', lineHeight: 1.6 }}>
             Scores update instantly. Weights of <strong style={{ color: '#64748b' }}>0</strong> exclude that dimension entirely.
           </div>
-        </div>
+        </div> {/* end score weights */}
       </aside>
 
       {/* Main */}
@@ -456,7 +557,14 @@ export default function DeckSuggestions() {
           <div>
             <h1 style={{ fontSize: 22, fontWeight: 800, margin: 0, color: '#f1f5f9', letterSpacing: -0.5 }}>Deck Suggestions</h1>
             <p style={{ fontSize: 13, color: '#475569', margin: '4px 0 0' }}>
-              {displayedSuggestions.length > 0 ? `${displayedSuggestions.length} decks ranked by your weighted score` : 'Analysing your collection…'}
+              {displayedSuggestions.length > 0
+                ? `${displayedSuggestions.length} decks ranked by your weighted score`
+                : loading ? 'Analysing your collection…' : 'No decks match your filters'}
+              {colorFilter.length > 0 && (
+                <span style={{ color: '#c9a84c', marginLeft: 6 }}>
+                  · {colorFilter.map((c) => COLOR_META[c].emoji).join('')} only
+                </span>
+              )}
             </p>
           </div>
           <button onClick={fetchSuggestions} disabled={loading} style={{
