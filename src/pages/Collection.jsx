@@ -2,7 +2,8 @@ import { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../App';
 import { loadCollection, upsertCard, removeCard } from '../utils/collectionStore';
 import { searchCard, searchCards } from '../utils/scryfallApi';
-import { syncCollection, getCollectionMeta } from '../utils/collectionSync';
+import { syncCollection, getCollectionMeta, enrichMissingImages } from '../utils/collectionSync';
+import { initBulkData } from '../utils/bulkDataManager';
 
 const CONDITIONS = ['NM', 'LP', 'MP', 'HP', 'DMG'];
 
@@ -19,10 +20,33 @@ export default function Collection() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [showImport, setShowImport] = useState(false);
 
+  const [backfillStatus, setBackfillStatus] = useState(null); // null | 'downloading' | 'enriching' | 'done'
+
   useEffect(() => {
     loadCollection(user.uid).then((c) => { setCards(c); setLoading(false); });
   }, [user.uid]);
 
+  // Backfill images for existing cards. If bulk data isn't cached yet, download it first.
+  useEffect(() => {
+    if (loading || !cards.length) return;
+    const hasMissing = cards.some((c) => !c.imageUri);
+    if (!hasMissing) return;
+
+    (async () => {
+      try {
+        setBackfillStatus('downloading');
+        await initBulkData((p) => {
+          if (p.phase === 'ready') setBackfillStatus('enriching');
+        });
+        setBackfillStatus('enriching');
+        await enrichMissingImages(user.uid, cards, setCards);
+        setBackfillStatus('done');
+      } catch (e) {
+        console.warn('[Collection] Image backfill failed:', e.message);
+        setBackfillStatus(null);
+      }
+    })();
+  }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
   async function handleAdd(cardData) {
     const id = await upsertCard(user.uid, cardData);
     setCards((prev) => {
@@ -104,6 +128,15 @@ export default function Collection() {
         <div className="card-panel fade-in" style={{ marginBottom:24, border:'1px solid var(--border-gold)' }}>
           <h2 style={{ fontFamily:'var(--font-display)', fontSize:15, color:'var(--gold-bright)', marginBottom:18 }}>Add a Card</h2>
           <AddCardForm onAdd={handleAdd} />
+        </div>
+      )}
+
+      {backfillStatus && backfillStatus !== 'done' && (
+        <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:16, padding:'10px 14px', background:'rgba(201,168,76,0.08)', border:'1px solid var(--border-gold)', borderRadius:'var(--radius)', fontSize:13, color:'var(--text-secondary)' }}>
+          <div className="spinner" style={{ width:14, height:14, borderWidth:2, flexShrink:0 }} />
+          {backfillStatus === 'downloading'
+            ? 'Downloading card image database for the first time… (this may take a minute)'
+            : 'Loading card images…'}
         </div>
       )}
 
@@ -287,13 +320,18 @@ function ImportForm({ uid, onDone }) {
         <div style={{ marginTop:10 }}>
           <div style={{ display:'flex', justifyContent:'space-between', marginBottom:4 }}>
             <span style={{ fontSize:11, color:'var(--text-muted)' }}>
-              {progress.phase === 'parsing' ? 'Parsing…' : 'Syncing to cloud…'}
+              {progress.label || (progress.phase === 'parsing' ? 'Parsing…' : 'Syncing to cloud…')}
             </span>
             <span style={{ fontSize:11, color:'var(--text-muted)', fontFamily:'monospace' }}>{progress.pct}%</span>
           </div>
           <div style={{ height:3, background:'var(--bg-elevated)', borderRadius:2, overflow:'hidden' }}>
             <div style={{ height:'100%', width:`${progress.pct}%`, background:'var(--gold-bright)', borderRadius:2, transition:'width 0.3s ease' }} />
           </div>
+          {(progress.phase === 'bulk_download' || progress.phase === 'bulk_index') && (
+            <p style={{ fontSize:10, color:'var(--text-muted)', marginTop:4 }}>
+              First-time setup: downloading Scryfall card database for images (~100 MB). Future imports will be instant.
+            </p>
+          )}
         </div>
       )}
 
@@ -315,7 +353,12 @@ function ImportForm({ uid, onDone }) {
         disabled={submitting || !rawText.trim()}
         style={{ marginTop:14 }}
       >
-        {submitting ? (progress?.phase === 'parsing' ? 'Parsing…' : 'Syncing…') : 'Import Collection'}
+        {submitting ? (
+          progress?.phase === 'parsing' ? 'Parsing…' :
+          progress?.phase?.startsWith('bulk') ? 'Loading card database…' :
+          progress?.phase === 'enriching' ? 'Fetching images…' :
+          'Syncing…'
+        ) : 'Import Collection'}
       </button>
     </div>
   );
