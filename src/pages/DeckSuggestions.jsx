@@ -548,7 +548,8 @@ export default function DeckSuggestions() {
           <div style={{ fontSize: 11, color: '#475569', lineHeight: 1.6 }}>
             Scores update instantly. Weights of <strong style={{ color: '#64748b' }}>0</strong> exclude that dimension entirely.
           </div>
-        </div> {/* end score weights */}
+        </div>
+        </div> {/* end score weights wrapper */}
       </aside>
 
       {/* Main */}
