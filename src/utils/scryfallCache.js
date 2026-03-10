@@ -1,170 +1,220 @@
-// src/utils/scryfallApi.js
-// Wrapper for the Scryfall API (free, no key required)
-// Docs: https://scryfall.com/docs/api
-//
-// Card lookups check local IndexedDB bulk data first via bulkDataManager.
-// The live API is only hit when bulk data isn't available yet.
+// src/utils/scryfallCache.js
+// Fetches the slim Scryfall card JSON from Firebase Storage (updated nightly),
+// caches it in IndexedDB for 24 hours, and exposes fast name-based lookups.
 
-import { lookupCard, lookupCardExact, isCacheReady } from './scryfallCache';
+const DB_NAME    = 'scryfall_cache';
+const DB_VERSION = 1;
+const STORE      = 'cards';
+const META_STORE = 'meta';
+const TTL_MS     = 24 * 60 * 60 * 1000; // 24 hours
 
-const BASE = 'https://api.scryfall.com';
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+// Public URL written by the nightly GitHub Action
+const STORAGE_URL = `https://storage.googleapis.com/${import.meta.env.VITE_FIREBASE_STORAGE_BUCKET}/scryfall/cards-slim.json`;
 
 // ---------------------------------------------------------------------------
-// Memoised bulk-ready check
-// isCacheReady() hits IndexedDB every call — cache the result in memory so
-// we only pay that cost once per session, not once per card lookup.
+// IndexedDB helpers
 // ---------------------------------------------------------------------------
-let _bulkReadyCache = null;
+let _db = null;
 
-async function bulkReady() {
-  if (_bulkReadyCache !== null) return _bulkReadyCache;
-  _bulkReadyCache = await isCacheReady();
-  return _bulkReadyCache;
+function openDB() {
+  if (_db) return Promise.resolve(_db);
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(DB_NAME, DB_VERSION);
+    req.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE)) {
+        const store = db.createObjectStore(STORE, { keyPath: 'id' });
+        store.createIndex('name_lower', 'name_lower', { unique: false });
+        store.createIndex('name_exact', 'name_exact', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(META_STORE)) {
+        db.createObjectStore(META_STORE, { keyPath: 'key' });
+      }
+    };
+    req.onsuccess  = (e) => { _db = e.target.result; resolve(_db); };
+    req.onerror    = ()  => reject(req.error);
+  });
 }
 
-/** Call this after initBulkData() completes so the memo is invalidated. */
-export function invalidateBulkReadyCache() {
-  _bulkReadyCache = null;
+async function getMeta(key) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(META_STORE, 'readonly').objectStore(META_STORE).get(key);
+    req.onsuccess = () => resolve(req.result?.value ?? null);
+    req.onerror   = () => reject(req.error);
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Live API cache (fallback only)
-// ---------------------------------------------------------------------------
-const memoryCache = new Map();
+async function setMeta(key, value) {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(META_STORE, 'readwrite');
+    tx.objectStore(META_STORE).put({ key, value });
+    tx.oncomplete = resolve;
+    tx.onerror    = () => reject(tx.error);
+  });
+}
 
-function cacheGet(key) {
-  try {
-    const raw = localStorage.getItem(`scryfall:${key}`);
-    if (raw) {
-      const { value, expiresAt } = JSON.parse(raw);
-      if (Date.now() < expiresAt) return value;
-      localStorage.removeItem(`scryfall:${key}`);
-    }
-  } catch {
-    const entry = memoryCache.get(key);
-    if (entry && Date.now() < entry.expiresAt) return entry.value;
-    if (entry) memoryCache.delete(key);
+async function getCardCount() {
+  const db = await openDB();
+  return new Promise((resolve, reject) => {
+    const req = db.transaction(STORE, 'readonly').objectStore(STORE).count();
+    req.onsuccess = () => resolve(req.result);
+    req.onerror   = () => reject(req.error);
+  });
+}
+
+async function storeCards(cards, onProgress) {
+  const db = await openDB();
+  // Clear old data first
+  await new Promise((resolve, reject) => {
+    const tx = db.transaction(STORE, 'readwrite');
+    tx.objectStore(STORE).clear();
+    tx.oncomplete = resolve;
+    tx.onerror    = () => reject(tx.error);
+  });
+
+  const BATCH = 1000;
+  let written = 0;
+  for (let i = 0; i < cards.length; i += BATCH) {
+    const batch = cards.slice(i, i + BATCH);
+    await new Promise((resolve, reject) => {
+      const tx    = db.transaction(STORE, 'readwrite');
+      const store = tx.objectStore(STORE);
+      for (const card of batch) {
+        store.put({ ...card, name_lower: card.name?.toLowerCase() ?? '', name_exact: card.name ?? '' });
+      }
+      tx.oncomplete = resolve;
+      tx.onerror    = () => reject(tx.error);
+    });
+    written += batch.length;
+    onProgress?.(written, cards.length);
   }
-  return null;
-}
-
-function cacheSet(key, value) {
-  const expiresAt = Date.now() + CACHE_TTL_MS;
-  try {
-    localStorage.setItem(`scryfall:${key}`, JSON.stringify({ value, expiresAt }));
-  } catch {
-    memoryCache.set(key, { value, expiresAt });
-  }
-}
-
-// ---------------------------------------------------------------------------
-// Rate-limit queue (live API fallback only)
-// ---------------------------------------------------------------------------
-let lastRequestAt = 0;
-const RATE_LIMIT_MS = 80;
-
-async function rateLimitedFetch(url) {
-  const now = Date.now();
-  const wait = RATE_LIMIT_MS - (now - lastRequestAt);
-  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
-  lastRequestAt = Date.now();
-  return fetch(url);
-}
-
-async function cachedFetch(url) {
-  const cached = cacheGet(url);
-  if (cached !== null) return cached;
-  const res = await rateLimitedFetch(url);
-  if (!res.ok) return null;
-  const data = await res.json();
-  cacheSet(url, data);
-  return data;
 }
 
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-export async function searchCard(name) {
-  if (await bulkReady()) {
-    const card = await lookupCard(name);
-    if (card) return card;
+/**
+ * isCacheReady
+ * True if IndexedDB has fresh card data (< 24 hrs old).
+ */
+export async function isCacheReady() {
+  try {
+    const last = await getMeta('lastDownloaded');
+    if (!last || Date.now() - last > TTL_MS) return false;
+    return (await getCardCount()) > 0;
+  } catch {
+    return false;
   }
-  return cachedFetch(`${BASE}/cards/named?fuzzy=${encodeURIComponent(name)}`);
-}
-
-export async function getCardByName(exactName) {
-  if (await bulkReady()) {
-    const card = await lookupCardExact(exactName);
-    if (card) return card;
-  }
-  return cachedFetch(`${BASE}/cards/named?exact=${encodeURIComponent(exactName)}`);
-}
-
-export async function searchCards(query, page = 1) {
-  const data = await cachedFetch(
-    `${BASE}/cards/search?q=${encodeURIComponent(query)}&page=${page}`
-  );
-  return data ?? { data: [], has_more: false, total_cards: 0 };
 }
 
 /**
- * resolveCardNames
- * Bulk path: parallel IndexedDB reads (no rate limit needed).
- * Live API path: sequential with rate limiting.
+ * initScryfallCache
+ * Downloads the slim JSON from Firebase Storage and indexes it.
+ * Safe to call multiple times — skips if cache is fresh.
+ *
+ * @param {function} onProgress ({ phase: 'download'|'index'|'ready', pct: 0-100 }) => void
  */
-export async function resolveCardNames(names) {
-  const bulk = await bulkReady();
-
-  if (bulk) {
-    // All lookups are local — fire them all in parallel
-    const results = await Promise.all(names.map((name) => lookupCard(name)));
-    return results.filter(Boolean);
+export async function initScryfallCache(onProgress) {
+  const ready = await isCacheReady();
+  if (ready) {
+    const count = await getCardCount();
+    onProgress?.({ phase: 'ready', pct: 100, cardCount: count });
+    return { fresh: false, cardCount: count };
   }
 
-  // Fallback: live API must stay sequential (rate limit)
-  const results = [];
-  for (const name of names) {
-    const card = await cachedFetch(`${BASE}/cards/named?fuzzy=${encodeURIComponent(name)}`);
-    if (card) results.push(card);
+  // Download slim JSON from Firebase Storage
+  onProgress?.({ phase: 'download', pct: 0 });
+  const res = await fetch(STORAGE_URL);
+  if (!res.ok) throw new Error(`Failed to fetch card data: ${res.status}`);
+
+  const contentLength = parseInt(res.headers.get('content-length') ?? '0', 10);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (contentLength > 0) {
+      onProgress?.({ phase: 'download', pct: Math.round((received / contentLength) * 50) });
+    }
   }
-  return results;
-}
 
-export async function getSynergyCards({ colors, format, strategy, excludeNames = [] }) {
-  const colorQuery = colors.length > 0 ? `color<=${colors.join('')}` : '';
-  const formatQuery = format ? `legal:${format}` : '';
-  let strategyQuery = '';
-  if (strategy === 'aggro') strategyQuery = '(t:creature cmc<=3)';
-  else if (strategy === 'control') strategyQuery = '(t:instant OR t:sorcery OR t:enchantment)';
-  else if (strategy === 'ramp') strategyQuery = '(o:add OR t:land o:search)';
-  else if (strategy === 'midrange') strategyQuery = '(t:creature cmc>=3 cmc<=5)';
-  const parts = [colorQuery, formatQuery, strategyQuery, '-is:digital', '-t:basic'].filter(Boolean);
-  try {
-    const data = await searchCards(parts.join(' '));
-    return (data.data ?? []).filter((c) => !excludeNames.includes(c.name));
-  } catch {
-    return [];
-  }
-}
+  onProgress?.({ phase: 'download', pct: 50 });
 
-// ---------------------------------------------------------------------------
-// Display helpers
-// ---------------------------------------------------------------------------
-export function getColorSymbol(color) {
-  const map = { W: '☀', U: '💧', B: '💀', R: '🔥', G: '🌿' };
-  return map[color] || color;
-}
+  const text  = await new Blob(chunks).text();
+  const cards = JSON.parse(text);
 
-export function getManaCostIcons(manaCost) {
-  if (!manaCost) return '';
-  return manaCost.replace(/\{([^}]+)\}/g, (_, s) => {
-    if (s === 'W') return '☀';
-    if (s === 'U') return '💧';
-    if (s === 'B') return '💀';
-    if (s === 'R') return '🔥';
-    if (s === 'G') return '🌿';
-    return s;
+  onProgress?.({ phase: 'index', pct: 50 });
+
+  await storeCards(cards, (written, total) => {
+    onProgress?.({ phase: 'index', pct: Math.round(50 + (written / total) * 50) });
   });
+
+  await setMeta('lastDownloaded', Date.now());
+  await setMeta('cardCount', cards.length);
+
+  onProgress?.({ phase: 'ready', pct: 100, cardCount: cards.length });
+  return { fresh: true, cardCount: cards.length };
+}
+
+/**
+ * lookupCard
+ * Case-insensitive name lookup. Prefers exact match, falls back to prefix.
+ */
+export async function lookupCard(name) {
+  if (!name) return null;
+  try {
+    const db    = await openDB();
+    const lower = name.toLowerCase().trim();
+
+    // Exact match
+    const exact = await new Promise((resolve, reject) => {
+      const req = db.transaction(STORE, 'readonly').objectStore(STORE).index('name_exact').get(name.trim());
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror   = () => reject(req.error);
+    });
+    if (exact) return exact;
+
+    // Lowercase exact
+    const lExact = await new Promise((resolve, reject) => {
+      const req = db.transaction(STORE, 'readonly').objectStore(STORE).index('name_lower').get(lower);
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror   = () => reject(req.error);
+    });
+    if (lExact) return lExact;
+
+    // Prefix scan
+    return new Promise((resolve, reject) => {
+      const range = IDBKeyRange.bound(lower, lower + '\uffff');
+      const req   = db.transaction(STORE, 'readonly').objectStore(STORE).index('name_lower').openCursor(range);
+      req.onsuccess = (e) => resolve(e.target.result?.value ?? null);
+      req.onerror   = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * lookupCardExact
+ * Strict case-sensitive exact name lookup. Faster than lookupCard.
+ */
+export async function lookupCardExact(name) {
+  if (!name) return null;
+  try {
+    const db = await openDB();
+    return new Promise((resolve, reject) => {
+      const req = db.transaction(STORE, 'readonly').objectStore(STORE).index('name_exact').get(name.trim());
+      req.onsuccess = () => resolve(req.result ?? null);
+      req.onerror   = () => reject(req.error);
+    });
+  } catch {
+    return null;
+  }
 }
