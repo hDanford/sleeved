@@ -5,21 +5,21 @@
 // Card lookups check local IndexedDB bulk data first via bulkDataManager.
 // The live API is only hit when bulk data isn't available yet.
 
-import { lookupCard, lookupCardExact, isBulkReady } from './bulkDataManager';
+import { lookupCard, lookupCardExact, isCacheReady } from './bulkDataManager';
 
 const BASE = 'https://api.scryfall.com';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 // ---------------------------------------------------------------------------
 // Memoised bulk-ready check
-// isBulkReady() hits IndexedDB every call — cache the result in memory so
+// isCacheReady() hits IndexedDB every call — cache the result in memory so
 // we only pay that cost once per session, not once per card lookup.
 // ---------------------------------------------------------------------------
 let _bulkReadyCache = null;
 
 async function bulkReady() {
   if (_bulkReadyCache !== null) return _bulkReadyCache;
-  _bulkReadyCache = await isBulkReady();
+  _bulkReadyCache = await isCacheReady();
   return _bulkReadyCache;
 }
 
