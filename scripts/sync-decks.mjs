@@ -5,50 +5,80 @@
 //
 // Runs nightly via GitHub Actions.
 //
-// Required secrets (set in GitHub repo Settings → Secrets):
-//   FIREBASE_SERVICE_ACCOUNT   JSON string of service-account key
-//   VITE_FIREBASE_STORAGE_BUCKET   e.g. "your-app.appspot.com"
+// Required secrets:
+//   FIREBASE_SERVICE_ACCOUNT        JSON string of service-account key
+//   FIREBASE_STORAGE_BUCKET         e.g. "your-app.appspot.com"
 
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import { getStorage } from 'firebase-admin/storage';
 
-// ── Firebase init ────────────────────────────────────────────────────────────
+// ── Firebase init ─────────────────────────────────────────────────────────────
 
 const rawSA = process.env.FIREBASE_SERVICE_ACCOUNT;
 const bucketName = process.env.FIREBASE_STORAGE_BUCKET;
 
-if (!rawSA) { console.error('ERROR: FIREBASE_SERVICE_ACCOUNT env var not set.'); process.exit(1); }
-if (!bucketName) { console.error('ERROR: FIREBASE_STORAGE_BUCKET env var not set.'); process.exit(1); }
+if (!rawSA) { console.error('ERROR: FIREBASE_SERVICE_ACCOUNT not set.'); process.exit(1); }
+if (!bucketName) { console.error('ERROR: FIREBASE_STORAGE_BUCKET not set.'); process.exit(1); }
 
 let serviceAccount;
-try {
-  serviceAccount = JSON.parse(rawSA);
-} catch (e) {
-  console.error('ERROR: Could not parse FIREBASE_SERVICE_ACCOUNT JSON:', e.message);
-  process.exit(1);
-}
+try { serviceAccount = JSON.parse(rawSA); }
+catch (e) { console.error('ERROR: Could not parse FIREBASE_SERVICE_ACCOUNT JSON:', e.message); process.exit(1); }
 
 initializeApp({ credential: cert(serviceAccount), storageBucket: bucketName });
 const db = getFirestore();
 const storageBucket = getStorage().bucket();
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// ── HTTP helpers ──────────────────────────────────────────────────────────────
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function fetchHtml(url, retries = 3) {
+// Full browser headers — required to avoid 403s from both sites
+const BROWSER_HEADERS = {
+  'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+  'Accept-Language': 'en-US,en;q=0.9',
+  'Accept-Encoding': 'gzip, deflate, br',
+  'Cache-Control': 'no-cache',
+  'Pragma': 'no-cache',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Upgrade-Insecure-Requests': '1',
+};
+
+async function fetchHtml(url, retries = 3, extraHeaders = {}) {
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(url, {
         headers: {
-          'User-Agent': 'Mozilla/5.0 (compatible; Sleeved/1.0)',
-          'Accept': 'text/html,application/xhtml+xml',
+          ...BROWSER_HEADERS,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+          ...extraHeaders,
+        },
+        signal: AbortSignal.timeout(25000),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return await res.text();
+    } catch (e) {
+      if (i === retries - 1) throw e;
+      await sleep(3000 * (i + 1));
+    }
+  }
+}
+
+async function fetchJson(url, retries = 3, extraHeaders = {}) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, {
+        headers: {
+          ...BROWSER_HEADERS,
+          'Accept': 'application/json, text/plain, */*',
+          ...extraHeaders,
         },
         signal: AbortSignal.timeout(20000),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.text();
+      return await res.json();
     } catch (e) {
       if (i === retries - 1) throw e;
       await sleep(2000 * (i + 1));
@@ -56,21 +86,18 @@ async function fetchHtml(url, retries = 3) {
   }
 }
 
-async function fetchJson(url, retries = 3) {
-  for (let i = 0; i < retries; i++) {
-    try {
-      const res = await fetch(url, {
-        headers: { 'User-Agent': 'Sleeved/1.0', 'Accept': 'application/json' },
-        signal: AbortSignal.timeout(15000),
-      });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return await res.json();
-    } catch (e) {
-      if (i === retries - 1) throw e;
-      await sleep(1500 * (i + 1));
-    }
-  }
+// Strip all HTML tags and decode basic entities from a string
+function stripHtml(str) {
+  return str
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&#\d+;/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
+
+// ── Color / strategy inference ────────────────────────────────────────────────
 
 function inferColors(name) {
   const n = name.toLowerCase();
@@ -126,10 +153,23 @@ function inferStrategy(name) {
 
 function parseArchetypeLinks(html) {
   const seen = new Map();
-  for (const m of html.matchAll(/href="\/archetype\/([^"#?]+)"[^>]*>([^<]{3,60})</g)) {
-    const slug = m[1].trim();
-    const name = m[2].trim().replace(/&amp;/g, '&');
-    if (!slug.includes('/') && !/^(all|budget|format)$/i.test(slug)) {
+
+  // MTGGoldfish renders archetype links in a table. The deck name text is often
+  // inside nested spans/divs, so we extract the full inner HTML of the <a> tag
+  // and strip tags to get the text, rather than expecting bare text after >.
+  const linkRe = /href="(\/archetype\/([^"#?\/]+))"[^>]*>([\s\S]*?)<\/a>/g;
+  for (const m of html.matchAll(linkRe)) {
+    const slug = m[2].trim();
+    const rawInner = m[3];
+    const name = stripHtml(rawInner);
+
+    if (
+      name.length >= 3 &&
+      name.length <= 80 &&
+      !slug.includes('/') &&
+      !/^(all|budget|format|metagame|more)$/i.test(slug) &&
+      !/^\s*$/.test(name)
+    ) {
       seen.set(slug, name);
     }
   }
@@ -138,37 +178,53 @@ function parseArchetypeLinks(html) {
 
 function parseDeckList(html) {
   const cards = [];
-  const start = html.indexOf('deck-view-deck-table');
-  if (start === -1) return null;
-  const end = html.indexOf('</table>', start);
-  const table = html.slice(start, end + 8);
-  let section = 'mainboard';
 
-  for (const row of table.split(/<tr[\s>]/)) {
-    if (row.includes('deck-category-header')) {
-      const text = row.replace(/<[^>]+>/g, ' ').toLowerCase();
-      if (text.includes('sideboard')) { section = 'sideboard'; continue; }
-      if (text.includes('land')) { section = 'land'; continue; }
-      section = 'mainboard';
-      continue;
-    }
-    const qty = row.match(/deck-col-qty[^>]*>\s*(\d+)/);
-    const name = row.match(/deck-col-card[^>]*>[\s\S]*?href="[^"]*">([^<]+)</);
-    if (qty && name) {
-      cards.push({
-        name: name[1].trim().replace(/&amp;/g, '&'),
-        quantity: parseInt(qty[1]),
-        section,
-      });
+  // Try the standard deck table first
+  const start = html.indexOf('deck-view-deck-table');
+  if (start !== -1) {
+    const end = html.indexOf('</table>', start);
+    const table = html.slice(start, end + 8);
+    let section = 'mainboard';
+
+    for (const row of table.split(/<tr[\s>]/)) {
+      if (row.includes('deck-category-header')) {
+        const text = row.replace(/<[^>]+>/g, ' ').toLowerCase();
+        if (text.includes('sideboard')) { section = 'sideboard'; continue; }
+        if (text.includes('land')) { section = 'land'; continue; }
+        section = 'mainboard';
+        continue;
+      }
+      const qty = row.match(/deck-col-qty[^>]*>\s*(\d+)/);
+      // Name may be in direct text or inside a nested element — strip all tags
+      const nameCell = row.match(/deck-col-card[^>]*>([\s\S]*?)(?:<\/td>|$)/);
+      if (qty && nameCell) {
+        const name = stripHtml(nameCell[1]);
+        if (name.length > 1) {
+          cards.push({ name, quantity: parseInt(qty[1]), section });
+        }
+      }
     }
   }
+
+  // Fallback: look for any qty+card pattern in the page if table parse got nothing
+  if (cards.length < 4) {
+    const fallbackRe = /(\d+)\s+<a[^>]+\/cards\/[^>]+>([^<]+)<\/a>/g;
+    for (const m of html.matchAll(fallbackRe)) {
+      const qty = parseInt(m[1]);
+      const name = m[2].trim().replace(/&amp;/g, '&');
+      if (qty >= 1 && qty <= 4 && name.length > 1) {
+        cards.push({ name, quantity: qty, section: 'mainboard' });
+      }
+    }
+  }
+
   return cards.length >= 4 ? cards : null;
 }
 
 function parseMetaShare(html, slug) {
   const idx = html.indexOf(`/archetype/${slug}`);
   if (idx === -1) return 0;
-  const m = html.slice(idx, idx + 500).match(/([\d.]+)%/);
+  const m = html.slice(idx, idx + 600).match(/([\d.]+)%/);
   return m ? parseFloat(m[1]) : 0;
 }
 
@@ -185,18 +241,29 @@ async function scrapeMTGGoldfish() {
     try {
       metagameHtml = await fetchHtml(`https://www.mtggoldfish.com/metagame/${format}/full`);
     } catch (e) {
-      console.warn(`  [${format}] Failed: ${e.message}`);
+      console.warn(`  [${format}] Failed to fetch metagame page: ${e.message}`);
       continue;
     }
 
     const archetypes = parseArchetypeLinks(metagameHtml).slice(0, MTGG_MAX_PER_FORMAT);
     console.log(`  [${format}] Found ${archetypes.length} archetypes`);
 
+    if (archetypes.length === 0) {
+      // Log a snippet of HTML to help debug if parser breaks again in future
+      console.warn(`  [${format}] Parser found 0 results. HTML snippet:`);
+      console.warn(metagameHtml.slice(0, 500));
+      continue;
+    }
+
     let count = 0;
     for (const { slug, name } of archetypes) {
-      await sleep(700);
+      await sleep(800);
       try {
-        const deckHtml = await fetchHtml(`https://www.mtggoldfish.com/archetype/${slug}`);
+        const deckHtml = await fetchHtml(
+          `https://www.mtggoldfish.com/archetype/${slug}`,
+          3,
+          { Referer: `https://www.mtggoldfish.com/metagame/${format}/full` }
+        );
         const keyCards = parseDeckList(deckHtml);
         if (!keyCards) continue;
 
@@ -215,8 +282,8 @@ async function scrapeMTGGoldfish() {
         });
         count++;
         if (count % 25 === 0) console.log(`  [${format}] ${count}/${archetypes.length} done`);
-      } catch (e) {
-        // skip failed archetypes silently
+      } catch (_) {
+        // skip individual failures silently
       }
     }
     console.log(`  [${format}] Done: ${count} decks`);
@@ -231,9 +298,16 @@ async function scrapeEDHREC(limit = 1000) {
   const all = [];
   console.log('\n── EDHREC ──');
 
+  // EDHREC requires Referer and Origin headers to avoid 403
+  const edhrecHeaders = {
+    Referer: 'https://edhrec.com/',
+    Origin: 'https://edhrec.com',
+    'Sec-Fetch-Site': 'same-site',
+  };
+
   let data;
   try {
-    data = await fetchJson('https://json.edhrec.com/pages/commanders.json');
+    data = await fetchJson('https://json.edhrec.com/pages/commanders.json', 3, edhrecHeaders);
   } catch (e) {
     console.warn(`  Failed to fetch commanders list: ${e.message}`);
     return [];
@@ -257,10 +331,12 @@ async function scrapeEDHREC(limit = 1000) {
 
   for (let i = 0; i < target.length; i++) {
     const commander = target[i];
-    await sleep(350);
+    await sleep(400);
     try {
       const deckData = await fetchJson(
-        `https://json.edhrec.com/pages/commanders/${commander.slug}.json`
+        `https://json.edhrec.com/pages/commanders/${commander.slug}.json`,
+        3,
+        edhrecHeaders
       );
       const dict = deckData?.container?.json_dict;
       if (!dict) continue;
@@ -289,7 +365,7 @@ async function scrapeEDHREC(limit = 1000) {
         syncedAt: new Date().toISOString(),
       });
     } catch (_) {
-      // skip failed commanders
+      // skip individual failures silently
     }
 
     if ((i + 1) % 100 === 0) console.log(`  ${i + 1}/${target.length} (${all.length} decks)`);
@@ -313,13 +389,10 @@ async function writeToFirestore(allDecks) {
 
   for (const [format, decks] of Object.entries(byFormat)) {
     console.log(`  ${format}: writing ${decks.length} decks…`);
-
     await db.collection('meta_decks').doc(format).set(
       { format, deckCount: decks.length, syncDate: today, lastUpdated: new Date() },
       { merge: true }
     );
-
-    // Firestore batch limit is 500 ops
     for (let i = 0; i < decks.length; i += 400) {
       const batch = db.batch();
       for (const deck of decks.slice(i, i + 400)) {
@@ -339,7 +412,6 @@ async function writeToStorage(allDecks) {
   const json = JSON.stringify(allDecks);
   const mb = (Buffer.byteLength(json) / 1024 / 1024).toFixed(1);
   console.log(`  Size: ${mb} MB`);
-
   const file = storageBucket.file('decks/all-decks.json');
   await file.save(json, {
     contentType: 'application/json',
@@ -369,7 +441,6 @@ async function main() {
 
   await writeToFirestore(allDecks);
   await writeToStorage(allDecks);
-
   console.log('\nDeck sync complete.');
 }
 
