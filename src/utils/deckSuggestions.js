@@ -1,63 +1,65 @@
 // src/utils/deckSuggestions.js
-// Loads all decks from the nightly-synced Firebase Storage cache,
-// then scores them entirely client-side using the local Scryfall card cache.
-// No live API calls at suggestion time.
 
-import { initDeckCache, getAllDecks } from './deckCache';
-import { initScryfallCache, lookupCard } from './scryfallCache';
+import { resolveCardNames } from './scryfallApi';
 import { scoreDeck, calculateMainScore, DEFAULT_WEIGHTS } from './deckScoring';
+import { fetchEDHRECDecks } from './deckSources/edhrecSource';
+import { fetchMTGGoldfishDecks, isMTGGoldfishAvailable } from './deckSources/mtgGoldfishSource';
+import { fetchScryfallArchetypeDecks } from './deckSources/scryfallSource';
 
 export { DEFAULT_WEIGHTS };
 
-// ---------------------------------------------------------------------------
-// Ensure both caches are ready before scoring
-// ---------------------------------------------------------------------------
-
 /**
- * ensureCaches
- * Downloads deck data and card data from Firebase Storage if stale.
- * Runs both in parallel. Calls onProgress with combined status.
+ * getCandidateDecks
+ * Each source is individually wrapped in try/catch so one failing source
+ * never kills the others.
  */
-export async function ensureCaches(onProgress) {
-  let cardPct = 0;
-  let deckPct = 0;
+export async function getCandidateDecks(formats, countPerFormat = 5) {
+  const perFormat = await Promise.allSettled(
+    formats.map(async (format) => {
+      if (format === 'commander') {
+        return fetchEDHRECDecks(countPerFormat);
+      }
 
-  const report = (label) => {
-    const combined = Math.round((cardPct + deckPct) / 2);
-    onProgress?.({ phase: 'loading', pct: combined, label });
-  };
+      if (isMTGGoldfishAvailable()) {
+        try {
+          const goldfish = await fetchMTGGoldfishDecks(format, countPerFormat);
+          if (goldfish.length > 0) return goldfish;
+        } catch {
+          // fall through to Scryfall
+        }
+      }
 
-  const [cardResult, deckResult] = await Promise.all([
-    initScryfallCache((p) => {
-      if (p.phase === 'download') cardPct = Math.round(p.pct * 0.5);
-      else if (p.phase === 'index')  cardPct = 50 + Math.round((p.pct - 50) * 0.5);
-      else if (p.phase === 'ready')  cardPct = 100;
-      report(p.phase === 'ready' ? 'Card database ready' : `Loading cards… ${p.pct}%`);
-    }),
-    initDeckCache((p) => {
-      deckPct = p.pct;
-      report(p.phase === 'ready' ? 'Deck database ready' : `Loading decks… ${p.pct}%`);
-    }),
-  ]);
+      return fetchScryfallArchetypeDecks(format).then((d) => d.slice(0, countPerFormat));
+    })
+  );
 
-  return { cardResult, deckResult };
+  // Collect fulfilled results, log failures
+  const all = [];
+  for (const outcome of perFormat) {
+    if (outcome.status === 'fulfilled') {
+      all.push(...(outcome.value ?? []));
+    } else {
+      console.warn('[deckSuggestions] Source fetch failed:', outcome.reason);
+    }
+  }
+
+  // Deduplicate by id
+  const seen = new Set();
+  return all.filter((d) => {
+    if (seen.has(d.id)) return false;
+    seen.add(d.id);
+    return true;
+  });
 }
 
-// ---------------------------------------------------------------------------
-// Score a single deck against the user's collection (fully local)
-// ---------------------------------------------------------------------------
-
 async function scoreSingleDeck({ deck, userCollection, userDeckProfiles, weights }) {
-  // Resolve card data from local IndexedDB cache — no network calls
-  const cardNames = (deck.keyCards ?? [])
+  const cardNames = deck.keyCards
     .filter((c) => c.section !== 'sideboard')
     .map((c) => c.name);
 
-  const resolvedCards = (
-    await Promise.all(cardNames.map((name) => lookupCard(name)))
-  ).filter(Boolean);
+  const resolvedCards = await resolveCardNames(cardNames);
 
-  const deckList = (deck.keyCards ?? []).map((c) => ({
+  const deckList = deck.keyCards.map((c) => ({
     ...c,
     section: c.section ?? 'mainboard',
   }));
@@ -73,65 +75,24 @@ async function scoreSingleDeck({ deck, userCollection, userDeckProfiles, weights
   return { ...deck, ...scored, resolvedCards };
 }
 
-// ---------------------------------------------------------------------------
-// Main entry point
-// ---------------------------------------------------------------------------
-
-/**
- * generateSuggestions
- *
- * @param {object} params
- * @param {Map}    params.userCollection     Map<cardNameLower, qty>
- * @param {Array}  params.userDeckProfiles   buildDeckProfile() results
- * @param {object} params.weights            Score weight overrides
- * @param {Array}  params.formats            Format filter ['commander','modern',...]
- * @param {Array}  params.colorFilter        Color filter ['W','G',...] — empty = all
- * @param {function} params.onProgress       ({ phase, pct, label, current, total }) => void
- */
 export async function generateSuggestions({
   userCollection,
   userDeckProfiles = [],
   weights = DEFAULT_WEIGHTS,
   formats = ['commander', 'standard', 'modern', 'pioneer'],
-  colorFilter = [],
+  countPerFormat = 5,
   onProgress,
 }) {
-  // Step 1: ensure both caches are warm
-  await ensureCaches((p) => onProgress?.({ ...p, current: 0, total: 0 }));
-
-  onProgress?.({ phase: 'loading_decks', pct: 95, label: 'Filtering decks…' });
-
-  // Step 2: load all decks and apply format + color filters
-  const allDecks = await getAllDecks();
-
-  const candidates = allDecks.filter((deck) => {
-    // Format filter
-    if (formats.length > 0 && !formats.includes(deck.format)) return false;
-    // Color filter: show decks whose colors are a subset of selected colors
-    if (colorFilter.length > 0 && deck.colors.length > 0) {
-      if (!deck.colors.every((c) => colorFilter.includes(c))) return false;
-    }
-    return true;
-  });
-
-  if (candidates.length === 0) return [];
-
-  // Step 3: score all candidates (local lookups, no API calls)
+  const candidates = await getCandidateDecks(formats, countPerFormat);
   const total = candidates.length;
   let completed = 0;
-  onProgress?.({ phase: 'scoring', pct: 0, label: `Scoring ${total} decks…`, current: 0, total });
+
+  onProgress?.(0, total);
 
   const settled = await Promise.allSettled(
     candidates.map((deck) =>
       scoreSingleDeck({ deck, userCollection, userDeckProfiles, weights }).then((result) => {
-        completed++;
-        onProgress?.({
-          phase: 'scoring',
-          pct: Math.round((completed / total) * 100),
-          label: `Scoring decks… ${completed}/${total}`,
-          current: completed,
-          total,
-        });
+        onProgress?.(++completed, total);
         return result;
       })
     )

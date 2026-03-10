@@ -19,15 +19,17 @@ export default function Collection() {
   const [showAddForm, setShowAddForm] = useState(false);
   const [showImport, setShowImport] = useState(false);
 
+  const [backfillStatus, setBackfillStatus] = useState(null); // null | 'downloading' | 'enriching' | 'done'
+
   useEffect(() => {
     loadCollection(user.uid).then((c) => { setCards(c); setLoading(false); });
   }, [user.uid]);
 
-  // Backfill images for cards already in Firestore that are missing them.
-  // Runs silently in the background using locally-cached bulk data (no download triggered).
+  // Backfill images for existing cards — downloads from Firebase Storage if cache is stale
   useEffect(() => {
     if (loading || !cards.length) return;
-    enrichMissingImages(user.uid, cards, setCards);
+    if (!cards.some((c) => !c.imageUri)) return;
+    enrichMissingImages(user.uid, cards, setCards, setBackfillStatus);
   }, [loading]); // eslint-disable-line react-hooks/exhaustive-deps
   async function handleAdd(cardData) {
     const id = await upsertCard(user.uid, cardData);
@@ -110,6 +112,15 @@ export default function Collection() {
         <div className="card-panel fade-in" style={{ marginBottom:24, border:'1px solid var(--border-gold)' }}>
           <h2 style={{ fontFamily:'var(--font-display)', fontSize:15, color:'var(--gold-bright)', marginBottom:18 }}>Add a Card</h2>
           <AddCardForm onAdd={handleAdd} />
+        </div>
+      )}
+
+      {backfillStatus && backfillStatus !== 'done' && (
+        <div style={{ display:'flex', alignItems:'center', gap:10, marginBottom:16, padding:'10px 14px', background:'rgba(201,168,76,0.08)', border:'1px solid var(--border-gold)', borderRadius:'var(--radius)', fontSize:13, color:'var(--text-secondary)' }}>
+          <div className="spinner" style={{ width:14, height:14, borderWidth:2, flexShrink:0 }} />
+          {backfillStatus === 'downloading'
+            ? 'Downloading card image database for the first time… (this may take a minute)'
+            : 'Loading card images…'}
         </div>
       )}
 

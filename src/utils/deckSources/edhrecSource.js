@@ -1,142 +1,147 @@
 // src/utils/deckSources/edhrecSource.js
-// Builds Commander deck archetypes using Scryfall search queries.
-// EDHREC's json.edhrec.com API is CORS-blocked in the browser, so we use
-// Scryfall to find popular commanders and build representative decklists.
+// Pulls Commander deck data from EDHREC's unofficial public JSON API.
+// Base: https://json.edhrec.com
+// No auth required. CORS-friendly for browser use.
 
-import { searchCards } from '../scryfallApi';
+const EDHREC_BASE = 'https://json.edhrec.com';
+const FETCH_TIMEOUT_MS = 6000; // give up on a single EDHREC request after 6s
 
-const COMMANDER_ARCHETYPES = [
-  {
-    id: 'edhrec-atraxa-praetors-voice',
-    name: "Atraxa, Praetors' Voice",
-    colors: ['W', 'U', 'B', 'G'],
-    strategy: 'goodstuff',
-    description: 'Proliferate counters and planeswalkers across all four colours.',
-    queries: ['o:proliferate f:commander', 'f:commander t:planeswalker (ci:wubg)', 'f:commander o:"+1/+1 counter" (ci:wubg) (r:rare OR r:mythic)'],
-  },
-  {
-    id: 'edhrec-edgar-markov',
-    name: 'Edgar Markov',
-    colors: ['W', 'B', 'R'],
-    strategy: 'aggro',
-    description: 'Vampire tribal — every vampire spell creates free tokens.',
-    queries: ['f:commander t:vampire (ci:wbr) (r:rare OR r:uncommon)', 'f:commander o:vampire o:token (ci:wbr)', 'f:commander o:lifelink t:vampire cmc<=3'],
-  },
-  {
-    id: 'edhrec-the-ur-dragon',
-    name: 'The Ur-Dragon',
-    colors: ['W', 'U', 'B', 'R', 'G'],
-    strategy: 'goodstuff',
-    description: 'Five-colour dragon tribal with massive flying threats.',
-    queries: ['f:commander t:dragon (r:rare OR r:mythic)', 'f:commander o:dragon (o:"search your library" OR o:"when ~ enters")', 'f:commander t:land o:add cmc=0'],
-  },
-  {
-    id: 'edhrec-meren-of-clan-nel-toth',
-    name: 'Meren of Clan Nel Toth',
-    colors: ['B', 'G'],
-    strategy: 'midrange',
-    description: 'Graveyard recursion engine — sacrifice and reanimate for value.',
-    queries: ['f:commander (ci:bg) o:dies t:creature (r:rare OR r:uncommon)', 'f:commander (ci:bg) o:graveyard o:return t:sorcery', 'f:commander (ci:bg) o:sacrifice o:token cmc<=3'],
-  },
-  {
-    id: 'edhrec-oloro-ageless-ascetic',
-    name: 'Oloro, Ageless Ascetic',
-    colors: ['W', 'U', 'B'],
-    strategy: 'control',
-    description: 'Esper control — gain life, draw cards, and outlast opponents.',
-    queries: ['f:commander (ci:wub) o:"whenever you gain life" (r:rare OR r:uncommon)', 'f:commander (ci:wub) (t:instant OR t:sorcery) o:counter cmc<=3', 'f:commander (ci:wub) t:creature o:lifelink (r:rare OR r:mythic)'],
-  },
-  {
-    id: 'edhrec-kaalia-of-the-vast',
-    name: 'Kaalia of the Vast',
-    colors: ['W', 'B', 'R'],
-    strategy: 'aggro',
-    description: 'Cheat Angels, Demons, and Dragons into play for free.',
-    queries: ['f:commander (ci:wbr) (t:angel OR t:demon OR t:dragon) (r:rare OR r:mythic)', 'f:commander (ci:wbr) o:haste t:creature cmc<=4'],
-  },
-  {
-    id: 'edhrec-krenko-mob-boss',
-    name: 'Krenko, Mob Boss',
-    colors: ['R'],
-    strategy: 'aggro',
-    description: 'Mono-red goblin tribal — exponential token generation.',
-    queries: ['f:commander ci:r t:goblin (r:uncommon OR r:rare)', 'f:commander ci:r o:goblin o:token', 'f:commander ci:r o:haste t:creature cmc<=2'],
-  },
-  {
-    id: 'edhrec-selvala-heart-of-the-wilds',
-    name: 'Selvala, Heart of the Wilds',
-    colors: ['G'],
-    strategy: 'ramp',
-    description: 'Mono-green ramp into massive creatures.',
-    queries: ['f:commander ci:g t:creature cmc>=6 (r:rare OR r:mythic)', 'f:commander ci:g o:add o:mana t:creature cmc<=3', 'f:commander ci:g o:"search your library" t:sorcery'],
-  },
-  {
-    id: 'edhrec-breya-etherium-shaper',
-    name: 'Breya, Etherium Shaper',
-    colors: ['W', 'U', 'B', 'R'],
-    strategy: 'combo',
-    description: 'Artifact combo — sacrifice artifacts for value and win conditions.',
-    queries: ['f:commander (ci:wubr) t:artifact t:creature (r:rare OR r:uncommon)', 'f:commander (ci:wubr) o:artifact o:sacrifice (t:instant OR t:sorcery)', 'f:commander (ci:wubr) o:"whenever an artifact" (r:uncommon OR r:rare)'],
-  },
-  {
-    id: 'edhrec-animar-soul-of-elements',
-    name: 'Animar, Soul of Elements',
-    colors: ['U', 'R', 'G'],
-    strategy: 'combo',
-    description: 'Temur creature storm — cast creatures to reduce costs to zero.',
-    queries: ['f:commander (ci:urg) t:creature cmc>=5 (r:rare OR r:mythic)', 'f:commander (ci:urg) o:morph t:creature', 'f:commander (ci:urg) o:"+1/+1 counter" t:creature cmc<=3'],
-  },
-];
+const pageCache = new Map();
 
-export async function fetchEDHRECDecks(count = 10) {
-  const archetypes = COMMANDER_ARCHETYPES.slice(0, count);
-  const results = [];
+/** Fetch with a timeout so a stalled request doesn't hang forever. */
+async function fetchWithTimeout(url, ms = FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), ms);
+  try {
+    const res = await fetch(url, { signal: controller.signal });
+    return res;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
-  for (const archetype of archetypes) {
-    try {
-      const cardMap = new Map();
-      for (const query of archetype.queries) {
-        const data = await searchCards(query);
-        for (const card of data?.data ?? []) {
-          if (!cardMap.has(card.name)) cardMap.set(card.name, card);
-          if (cardMap.size >= 40) break;
-        }
-      }
-      if (cardMap.size < 4) continue;
+async function fetchEDHRECPage(path) {
+  if (pageCache.has(path)) return pageCache.get(path);
+  try {
+    const res = await fetchWithTimeout(`${EDHREC_BASE}${path}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    pageCache.set(path, data);
+    return data;
+  } catch {
+    return null;
+  }
+}
 
-      const keyCards = [...cardMap.values()].map((card) => ({
+/**
+ * getTopCommanders
+ * Returns a list of popular commanders from EDHREC's top commanders page.
+ */
+export async function getTopCommanders(limit = 20) {
+  const data = await fetchEDHRECPage('/pages/commanders.json');
+  if (!data) return [];
+
+  const cardlists = data?.container?.json_dict?.cardlists ?? [];
+  const commanders = [];
+
+  for (const list of cardlists) {
+    for (const card of list?.cardviews ?? []) {
+      if (!card?.name) continue;
+      commanders.push({
         name: card.name,
-        quantity: guessQuantity(card, archetype.strategy),
-        section: card.type_line?.toLowerCase().includes('land') ? 'land' : 'mainboard',
-      }));
-
-      results.push({
-        id: archetype.id,
-        name: archetype.name,
-        source: 'EDHREC',
-        sourceUrl: `https://edhrec.com/commanders/${archetype.id.replace('edhrec-', '')}`,
-        format: 'commander',
-        strategy: archetype.strategy,
-        colors: archetype.colors,
-        description: archetype.description,
-        keyCards,
+        slug: card.sanitized ?? card.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
+        colorIdentity: card.color_identity ?? [],
+        salt: card.salt ?? 0,
+        rank: card.rank ?? 9999,
       });
-    } catch (err) {
-      console.warn(`[edhrecSource] Failed to build "${archetype.name}":`, err);
+      if (commanders.length >= limit) break;
+    }
+    if (commanders.length >= limit) break;
+  }
+
+  return commanders;
+}
+
+/**
+ * getCommanderDeck
+ * Fetches the recommended decklist for a specific commander by slug.
+ */
+export async function getCommanderDeck(slug) {
+  const data = await fetchEDHRECPage(`/pages/commanders/${slug}.json`);
+  if (!data) return null;
+
+  const dict = data?.container?.json_dict;
+  if (!dict) return null;
+
+  const deckList = [];
+
+  for (const list of dict?.cardlists ?? []) {
+    const section = (list?.tag ?? '').toLowerCase().includes('land') ? 'land' : 'mainboard';
+    for (const card of list?.cardviews ?? []) {
+      if (!card?.name) continue;
+      deckList.push({
+        name: card.name,
+        quantity: 1,
+        section,
+        inclusion: card.inclusion ?? 0,
+        synergy: card.synergy ?? 0,
+      });
     }
   }
 
-  return results;
+  const commanderName = dict?.card?.name;
+  if (commanderName) {
+    deckList.unshift({ name: commanderName, quantity: 1, section: 'commander' });
+  }
+
+  const colors = dict?.card?.color_identity ?? [];
+  const description = dict?.container?.meta?.description ?? '';
+
+  return { deckList, colors, description };
 }
 
-function guessQuantity(card, strategy) {
-  if (card.type_line?.toLowerCase().includes('land')) return 2;
-  if (card.rarity === 'mythic') return 1;
-  if (card.rarity === 'rare') return 1;
-  if (card.rarity === 'uncommon') return strategy === 'aggro' ? 3 : 2;
-  return 3;
+/**
+ * fetchEDHRECDecks
+ * Fetches all commander deck pages in parallel with Promise.allSettled
+ * so a single failing/slow page doesn't block the rest.
+ */
+export async function fetchEDHRECDecks(count = 10) {
+  const commanders = await getTopCommanders(count);
+  if (!commanders.length) return [];
+
+  // Fetch all commander pages in parallel
+  const settled = await Promise.allSettled(
+    commanders.map((commander) =>
+      getCommanderDeck(commander.slug).then((result) => ({ commander, result }))
+    )
+  );
+
+  const decks = [];
+  for (const outcome of settled) {
+    if (outcome.status !== 'fulfilled') continue;
+    const { commander, result } = outcome.value;
+    if (!result) continue;
+
+    decks.push({
+      id: `edhrec-${commander.slug}`,
+      name: commander.name,
+      source: 'EDHREC',
+      format: 'commander',
+      strategy: inferStrategy(result.colors),
+      colors: result.colors,
+      description: result.description || `EDHREC recommended build for ${commander.name}.`,
+      keyCards: result.deckList,
+    });
+  }
+
+  return decks;
 }
 
-// Keep these exports so nothing else breaks
-export async function getTopCommanders() { return []; }
-export async function getCommanderDeck() { return null; }
+function inferStrategy(colors) {
+  if (!colors?.length) return 'midrange';
+  if (colors.includes('R') && !colors.includes('U') && !colors.includes('B')) return 'aggro';
+  if (colors.includes('U') && colors.includes('B')) return 'control';
+  if (colors.includes('G') && colors.length <= 2) return 'ramp';
+  if (colors.length >= 4) return 'goodstuff';
+  return 'midrange';
+}
