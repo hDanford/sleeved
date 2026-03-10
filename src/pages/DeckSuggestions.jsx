@@ -376,7 +376,7 @@ export default function DeckSuggestions() {
   const [selectedFormats, setSelectedFormats] = useState([...ALL_FORMATS]);
   const [colorFilter, setColorFilter] = useState([]); // empty = no filter
   const [loading, setLoading] = useState(false);
-  const [progress, setProgress] = useState({ current: 0, total: 0 });
+  const [progress, setProgress] = useState({ phase: null, pct: 0, label: null, current: 0, total: 0 });
   const [expandedId, setExpandedId] = useState(null);
   const [error, setError] = useState(null);
 
@@ -400,21 +400,24 @@ export default function DeckSuggestions() {
         userDeckProfiles: [],
         weights,
         formats: selectedFormats,
-        onProgress: (current, total) => setProgress({ current, total }),
+        colorFilter,
+        onProgress: (p) => setProgress(typeof p === 'object' ? p : { current: p, total: arguments[1] }),
       });
       setSuggestions(results);
     } catch (e) {
-      setError('Failed to generate suggestions. Please try again.');
+      setError(e.message?.includes('fetch') || e.message?.includes('storage')
+        ? 'Deck database not yet available. Run the sync workflow in GitHub Actions first, then try again.'
+        : 'Failed to load suggestions. Please try again.');
       console.error(e);
     } finally {
       setLoading(false);
     }
-  }, [userCollection, selectedFormats]); // eslint-disable-line
+  }, [userCollection, selectedFormats, colorFilter]); // eslint-disable-line
 
-  // Refetch when collection loads or formats change
+  // Refetch when collection loads, formats, or color filter changes
   useEffect(() => {
     if (userCollection.size > 0) fetchSuggestions();
-  }, [userCollection, selectedFormats]); // eslint-disable-line
+  }, [userCollection, selectedFormats, colorFilter]); // eslint-disable-line
 
   // Re-score + re-filter when weights or color filter change
   useEffect(() => {
@@ -579,17 +582,23 @@ export default function DeckSuggestions() {
 
         {loading && (
           <div style={{ background: '#111320', border: '1px solid #1e2030', borderRadius: 12, padding: 32, textAlign: 'center' }}>
-            <div style={{ fontSize: 13, color: '#64748b', marginBottom: 14 }}>Fetching card data from Scryfall…</div>
+            <div style={{ fontSize: 13, color: '#64748b', marginBottom: 14 }}>
+              {progress.label ?? (progress.phase === 'scoring'
+                ? `Scoring decks… ${progress.current ?? 0}/${progress.total ?? '?'}`
+                : 'Loading deck database…')}
+            </div>
             <div style={{ height: 4, background: '#1e2030', borderRadius: 2, overflow: 'hidden', maxWidth: 320, margin: '0 auto' }}>
               <div style={{
                 height: '100%',
-                width: progress.total > 0 ? `${(progress.current / progress.total) * 100}%` : '30%',
+                width: `${progress.pct ?? (progress.total > 0 ? Math.round((progress.current / progress.total) * 100) : 30)}%`,
                 background: '#2563eb', borderRadius: 2, transition: 'width 0.3s ease',
-                animation: progress.total === 0 ? 'pulse 1.5s infinite' : 'none',
+                animation: !progress.pct && !progress.total ? 'pulse 1.5s infinite' : 'none',
               }} />
             </div>
             {progress.total > 0 && (
-              <div style={{ fontSize: 11, color: '#475569', marginTop: 8 }}>{progress.current} / {progress.total} archetypes scored</div>
+              <div style={{ fontSize: 11, color: '#475569', marginTop: 8 }}>
+                {progress.current} / {progress.total} decks scored
+              </div>
             )}
           </div>
         )}
