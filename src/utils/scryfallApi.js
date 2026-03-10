@@ -5,7 +5,7 @@
 // Card lookups check local IndexedDB bulk data first via bulkDataManager.
 // The live API is only hit when bulk data isn't available yet.
 
-import { lookupCard, lookupCardExact, isCacheReady } from './bulkDataManager';
+import { lookupCard, lookupCardExact, isCacheReady } from './scryfallCache';
 
 const BASE = 'https://api.scryfall.com';
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
