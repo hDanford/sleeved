@@ -8,12 +8,14 @@ import Import from './pages/Import';
 import DeckSuggestions from './pages/DeckSuggestions';
 import BrowseCards from './pages/BrowseCards';
 import BrowseDecks from './pages/BrowseDecks';
+import { loadCollection } from './utils/collectionStore';
 
 export const AuthContext = createContext(null);
 export const useAuth = () => useContext(AuthContext);
 
 export default function App() {
   const [user, setUser] = useState(undefined);
+  const [userCollection, setUserCollection] = useState(new Map());
 
   useEffect(() => {
     getRedirectResult(auth)
@@ -22,6 +24,18 @@ export default function App() {
     const unsub = onAuthStateChanged(auth, (u) => {
       console.log('auth state changed', u);
       setUser(u || null);
+      if (u) {
+        loadCollection(u.uid).then((cards) => {
+          const map = new Map();
+          for (const card of cards) {
+            const key = card.name?.toLowerCase();
+            if (key) map.set(key, (map.get(key) ?? 0) + (card.quantity ?? 1));
+          }
+          setUserCollection(map);
+        }).catch(() => {});
+      } else {
+        setUserCollection(new Map());
+      }
     });
     return unsub;
   }, []);
@@ -45,7 +59,7 @@ export default function App() {
               <Route path="/collection/add" element={<Collection />} />
               <Route path="/import" element={<Import />} />
               <Route path="/decks" element={<MyDecks />} />
-              <Route path="/decks/suggest" element={<DeckSuggestions />} />
+              <Route path="/decks/suggest" element={<DeckSuggestions userCollection={userCollection} />} />
               <Route path="/browse/decks" element={<BrowseDecks />} />
               <Route path="/browse/cards" element={<BrowseCards />} />
             </Routes>
