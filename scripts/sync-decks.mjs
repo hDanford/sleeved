@@ -27,12 +27,10 @@ const storageBucket = getStorage().bucket();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-const BASE_HEADERS = {
+// Plain browser headers for MTGGoldfish (needs to look like a real browser)
+const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Accept-Language': 'en-US,en;q=0.9',
-  'Accept-Encoding': 'gzip, deflate, br',
-  'Cache-Control': 'no-cache',
-  'Pragma': 'no-cache',
   'Upgrade-Insecure-Requests': '1',
 };
 
@@ -41,8 +39,8 @@ async function fetchHtml(url, extraHeaders = {}, retries = 3) {
     try {
       const res = await fetch(url, {
         headers: {
-          ...BASE_HEADERS,
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          ...BROWSER_HEADERS,
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
           ...extraHeaders,
         },
         signal: AbortSignal.timeout(30000),
@@ -56,16 +54,12 @@ async function fetchHtml(url, extraHeaders = {}, retries = 3) {
   }
 }
 
-async function fetchJson(url, extraHeaders = {}, retries = 3) {
+// EDHREC works with a plain fetch — no special headers (confirmed by open source tools).
+// Adding fake browser headers can actually trigger Cloudflare bot detection.
+async function fetchJsonPlain(url, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(url, {
-        headers: {
-          ...BASE_HEADERS,
-          'Accept': 'application/json, text/javascript, */*; q=0.01',
-          'X-Requested-With': 'XMLHttpRequest',
-          ...extraHeaders,
-        },
         signal: AbortSignal.timeout(20000),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -133,12 +127,11 @@ function inferStrategy(name) {
 }
 
 // ── MTGGoldfish scraper ───────────────────────────────────────────────────────
-// MTGGoldfish uses single-quoted HTML attributes, e.g. href='/archetype/burn'
-// The regex must match BOTH single and double quotes.
+// MTGGoldfish uses single-quoted HTML attributes throughout.
 
 function parseArchetypeLinks(html) {
   const seen = new Map();
-  // Match href with single OR double quotes
+  // Match both single and double quoted href attributes
   const re = /href=['"]\/archetype\/([^'"#?\/\s]{2,})['"][^>]*>([\s\S]*?)<\/a>/g;
   for (const m of html.matchAll(re)) {
     const slug = m[1].trim();
@@ -181,7 +174,6 @@ function parseDeckList(html) {
 }
 
 function parseMetaShare(html, slug) {
-  // single or double quoted href
   const idx = html.search(new RegExp(`href=['"]\/archetype\/${slug}['"]`));
   if (idx === -1) return 0;
   const m = html.slice(idx, idx + 600).match(/([\d.]+)%/);
@@ -212,10 +204,9 @@ async function scrapeMTGGoldfish() {
     console.log(`  [${format}] Found ${archetypes.length} archetypes`);
 
     if (archetypes.length === 0) {
-      // Print a snippet that shows the area around "archetype" to debug
       const idx = html.indexOf('archetype');
-      console.warn(`  [${format}] Debug — 'archetype' context in HTML:`);
-      console.warn(idx === -1 ? '  (word "archetype" not found in page)' : html.slice(Math.max(0, idx - 50), idx + 200));
+      console.warn(`  [${format}] Debug — context around 'archetype':`);
+      console.warn(idx === -1 ? '  (word not found)' : html.slice(Math.max(0, idx - 50), idx + 200));
       continue;
     }
 
@@ -252,90 +243,124 @@ async function scrapeMTGGoldfish() {
 }
 
 // ── EDHREC scraper ────────────────────────────────────────────────────────────
-// json.edhrec.com is behind Cloudflare — use the main site's internal API
-// endpoint instead, which is less aggressively protected.
+// Uses plain fetch with no headers — confirmed working by open source EDHREC tools.
+// The commanders list endpoint can 403 on known CI IPs, so we fall back to
+// scraping the HTML page for commander slugs if needed.
+
+function formatCommanderSlug(name) {
+  return name.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, '-');
+}
+
+async function getCommanderSlugs(limit) {
+  // Attempt 1: JSON API (works outside of CI environments)
+  try {
+    const data = await fetchJsonPlain('https://json.edhrec.com/pages/commanders.json');
+    const commanders = [];
+    for (const list of data?.container?.json_dict?.cardlists ?? []) {
+      for (const card of list?.cardviews ?? []) {
+        if (!card?.name) continue;
+        commanders.push({
+          name: card.name,
+          slug: card.sanitized ?? formatCommanderSlug(card.name),
+          colorIdentity: card.color_identity ?? [],
+          rank: card.rank ?? 9999,
+        });
+      }
+    }
+    if (commanders.length > 0) {
+      commanders.sort((a, b) => a.rank - b.rank);
+      console.log(`  Got ${commanders.length} commanders from JSON API`);
+      return commanders.slice(0, limit);
+    }
+  } catch (e) {
+    console.warn(`  JSON API failed (${e.message}), trying HTML fallback…`);
+  }
+
+  // Attempt 2: Scrape the HTML commanders page
+  try {
+    const html = await fetchHtml('https://edhrec.com/commanders', {
+      Referer: 'https://edhrec.com/',
+    });
+    const commanders = [];
+    // EDHREC HTML embeds commander data in a __NEXT_DATA__ JSON script tag
+    const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
+    if (nextDataMatch) {
+      const nextData = JSON.parse(nextDataMatch[1]);
+      // Walk the props tree to find cardviews
+      const cards = nextData?.props?.pageProps?.data?.container?.json_dict?.cardlists ?? [];
+      for (const list of cards) {
+        for (const card of list?.cardviews ?? []) {
+          if (!card?.name) continue;
+          commanders.push({
+            name: card.name,
+            slug: card.sanitized ?? formatCommanderSlug(card.name),
+            colorIdentity: card.color_identity ?? [],
+            rank: card.rank ?? 9999,
+          });
+        }
+      }
+    }
+
+    // Also try plain href scraping as last resort
+    if (commanders.length === 0) {
+      for (const m of html.matchAll(/href=['"]\/commanders\/([^'"?\s]+)['"]/g)) {
+        const slug = m[1].trim();
+        if (slug && !commanders.find(c => c.slug === slug)) {
+          commanders.push({ name: slug.replace(/-/g, ' '), slug, colorIdentity: [], rank: 9999 });
+        }
+      }
+    }
+
+    if (commanders.length > 0) {
+      commanders.sort((a, b) => a.rank - b.rank);
+      console.log(`  Got ${commanders.length} commanders from HTML page`);
+      return commanders.slice(0, limit);
+    }
+  } catch (e) {
+    console.warn(`  HTML fallback also failed: ${e.message}`);
+  }
+
+  return [];
+}
 
 async function scrapeEDHREC(limit = 1000) {
   const all = [];
   console.log('\n── EDHREC ──');
 
-  const edhHeaders = {
-    Referer: 'https://edhrec.com/commanders',
-    Origin:  'https://edhrec.com',
-    'Sec-Fetch-Site': 'same-origin',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Dest': 'empty',
-  };
-
-  // Try both the JSON subdomain and the main site API path
-  const COMMANDERS_URLS = [
-    'https://json.edhrec.com/pages/commanders.json',
-    'https://edhrec.com/api/commanders/',
-  ];
-
-  let data = null;
-  for (const url of COMMANDERS_URLS) {
-    try {
-      data = await fetchJson(url, edhHeaders);
-      if (data) { console.log(`  Using commanders data from: ${url}`); break; }
-    } catch (e) {
-      console.warn(`  ${url} failed: ${e.message}`);
-    }
-  }
-
-  if (!data) {
-    console.warn('  Could not fetch EDHREC commanders — skipping.');
+  const commanders = await getCommanderSlugs(limit);
+  if (commanders.length === 0) {
+    console.warn('  Could not get commander list — skipping EDHREC.');
     return [];
   }
+  console.log(`  Fetching ${commanders.length} commander decks…`);
 
-  // Parse commander list — handle both API shapes
-  const commanders = [];
-  const cardlists = data?.container?.json_dict?.cardlists   // json.edhrec.com shape
-    ?? data?.commanders                                       // possible API shape
-    ?? [];
-
-  for (const list of Array.isArray(cardlists) ? cardlists : []) {
-    const items = list?.cardviews ?? (Array.isArray(list) ? list : []);
-    for (const card of items) {
-      if (!card?.name) continue;
-      commanders.push({
-        name: card.name,
-        slug: card.sanitized ?? card.name.toLowerCase().replace(/[^a-z0-9]+/g, '-'),
-        colorIdentity: card.color_identity ?? [],
-        rank: card.rank ?? 9999,
-      });
-    }
-  }
-
-  commanders.sort((a, b) => a.rank - b.rank);
-  const target = commanders.slice(0, limit);
-  console.log(`  Fetching ${target.length} commander decks…`);
-
-  for (let i = 0; i < target.length; i++) {
-    const commander = target[i];
-    await sleep(450);
+  for (let i = 0; i < commanders.length; i++) {
+    const commander = commanders[i];
+    await sleep(400);
     try {
-      let deckData = null;
-      for (const base of ['https://json.edhrec.com/pages/commanders/', 'https://edhrec.com/api/commanders/']) {
-        try {
-          deckData = await fetchJson(`${base}${commander.slug}.json`, edhHeaders);
-          if (deckData) break;
-        } catch (_) { /* try next */ }
-      }
-      if (!deckData) continue;
+      // Plain fetch — no headers, matching how open source EDHREC tools work
+      const deckData = await fetchJsonPlain(
+        `https://json.edhrec.com/pages/commanders/${commander.slug}.json`
+      );
 
+      // Use the exact JSON path confirmed by edhrec_json_to_txt source code:
+      // json_data["container"]["json_dict"]["cardlists"][n]["header"]
+      // json_data["container"]["json_dict"]["cardlists"][n]["cardviews"][n]["name"]
       const dict = deckData?.container?.json_dict;
       if (!dict) continue;
 
-      const keyCards = [];
+      const commanderName = dict?.card?.name ?? commander.name;
+      const keyCards = [{ name: commanderName, quantity: 1, section: 'commander' }];
+
       for (const list of dict?.cardlists ?? []) {
-        const section = (list?.tag ?? '').toLowerCase().includes('land') ? 'land' : 'mainboard';
+        // Use "header" (confirmed key) to determine section; fall back to "tag"
+        const header = (list?.header ?? list?.tag ?? '').toLowerCase();
+        const section = header.includes('land') ? 'land' : 'mainboard';
         for (const card of list?.cardviews ?? []) {
           if (card?.name) keyCards.push({ name: card.name, quantity: 1, section });
         }
       }
-      const commanderName = dict?.card?.name ?? commander.name;
-      keyCards.unshift({ name: commanderName, quantity: 1, section: 'commander' });
+
       if (keyCards.length < 10) continue;
 
       all.push({
@@ -350,9 +375,9 @@ async function scrapeEDHREC(limit = 1000) {
         keyCards,
         syncedAt: new Date().toISOString(),
       });
-    } catch (_) { /* skip */ }
+    } catch (_) { /* skip individual failures */ }
 
-    if ((i + 1) % 100 === 0) console.log(`  ${i + 1}/${target.length} (${all.length} decks)`);
+    if ((i + 1) % 100 === 0) console.log(`  ${i + 1}/${commanders.length} (${all.length} decks)`);
   }
 
   console.log(`  Done: ${all.length} commander decks`);
