@@ -39,28 +39,20 @@ const COLOR_SYMBOLS = { W: '☀️', U: '💧', B: '💀', R: '🔥', G: '🌿' 
 
 // ─── Score helpers ────────────────────────────────────────────────────────────
 
-async function scoreDecksChunk(rawDecks, userCollection, userDeckProfiles, weights) {
-  const results = [];
-  const settled = await Promise.allSettled(
-    rawDecks.map(async (deck) => {
-      const names = (deck.keyCards ?? [])
-        .filter((c) => c.section !== 'sideboard')
-        .map((c) => c.name);
-      const resolvedCards = await resolveCardNames(names);
-      const scored = scoreDeck({
-        deckList: deck.keyCards ?? [],
-        resolvedCards,
-        userCollection,
-        userDeckProfiles,
-        weights,
-      });
-      return { ...deck, ...scored, resolvedCards };
-    })
-  );
-  for (const r of settled) {
-    if (r.status === 'fulfilled') results.push(r.value);
-  }
-  return results;
+// Score decks WITHOUT calling Scryfall — ownership + style work from local data,
+// strength/synergy return neutral values (50/0) until a deck is opened in the modal.
+// This avoids making thousands of API calls on page load.
+function scoreDecksChunk(rawDecks, userCollection, userDeckProfiles, weights) {
+  return rawDecks.map((deck) => {
+    const scored = scoreDeck({
+      deckList: deck.keyCards ?? [],
+      resolvedCards: [], // deferred until modal opens
+      userCollection,
+      userDeckProfiles,
+      weights,
+    });
+    return { ...deck, ...scored, resolvedCards: null };
+  });
 }
 
 // ─── Small UI pieces ──────────────────────────────────────────────────────────
@@ -411,8 +403,6 @@ export default function DeckSuggestions({ userCollection }) {
 
   // Scored state
   const [scoredDecks, setScoredDecks] = useState([]);
-  const [scoring, setScoring] = useState(false);
-  const [scoringProgress, setScoringProgress] = useState({ done: 0, total: 0 });
 
   // Detail modal
   const [detailDeck, setDetailDeck] = useState(null);
@@ -455,36 +445,11 @@ export default function DeckSuggestions({ userCollection }) {
     return () => { alive = false; };
   }, [activeFormat]);
 
-  // ── Score decks ──
+  // ── Score decks (synchronous — no Scryfall on list view) ──
   useEffect(() => {
     if (!rawDecks.length) return;
-    let alive = true;
-    const CHUNK = 15;
-    const allScored = [];
-
-    setScoring(true);
-    setScoredDecks([]);
-    setScoringProgress({ done: 0, total: rawDecks.length });
-
-    (async () => {
-      for (let i = 0; i < rawDecks.length; i += CHUNK) {
-        if (!alive) return;
-        const chunk = rawDecks.slice(i, i + CHUNK);
-        const scored = await scoreDecksChunk(chunk, userCollection ?? new Map(), profilesRef.current, weights);
-        allScored.push(...scored);
-        if (!alive) return;
-        setScoringProgress({ done: Math.min(i + CHUNK, rawDecks.length), total: rawDecks.length });
-      }
-      if (!alive) return;
-      setScoredDecks([...allScored].sort((a, b) => b.mainScore - a.mainScore));
-      setScoring(false);
-    })().catch((e) => {
-      if (!alive) return;
-      console.error(e);
-      setScoring(false);
-    });
-
-    return () => { alive = false; };
+    const scored = scoreDecksChunk(rawDecks, userCollection ?? new Map(), profilesRef.current, weights);
+    setScoredDecks([...scored].sort((a, b) => b.mainScore - a.mainScore));
   }, [rawDecks, userCollection]); // eslint-disable-line
 
   // ── Re-weight ──
@@ -505,8 +470,7 @@ export default function DeckSuggestions({ userCollection }) {
   }, [scoredDecks, activeStrategy]);
 
   const strategies = ['all', ...Array.from(new Set(scoredDecks.map((d) => d.strategy).filter(Boolean))).sort()];
-  const isLoading = loadingCatalog || scoring;
-  const pct = scoringProgress.total > 0 ? (scoringProgress.done / scoringProgress.total) * 100 : 0;
+  const isLoading = loadingCatalog;
 
   return (
     <div style={{ display: 'grid', gridTemplateColumns: '240px 1fr', gap: 20, minHeight: '80vh' }}>
@@ -612,9 +576,7 @@ export default function DeckSuggestions({ userCollection }) {
           </h1>
           <p style={{ margin: 0, fontSize: 13, color: '#334155' }}>
             {isLoading
-              ? scoring
-                ? `Scoring ${scoringProgress.done} / ${scoringProgress.total} decks…`
-                : 'Loading catalog from Firestore…'
+              ? 'Loading catalog from Firestore…'
               : catalogError === 'no_data'
                 ? `No decks synced yet for ${FORMAT_LABELS[activeFormat]}`
                 : catalogError === 'error'
@@ -627,16 +589,15 @@ export default function DeckSuggestions({ userCollection }) {
           </p>
         </div>
 
-        {/* Progress bar */}
-        {(loadingCatalog || (scoring && scoringProgress.total > 0)) && (
+        {/* Loading bar */}
+        {loadingCatalog && (
           <div style={{ marginBottom: 14 }}>
             <div style={{ height: 2, background: '#181a2a', borderRadius: 2, overflow: 'hidden' }}>
               <div style={{
-                height: '100%',
-                width: loadingCatalog ? '100%' : `${pct}%`,
+                height: '100%', width: '100%',
                 background: FORMAT_COLORS[activeFormat],
-                borderRadius: 2, transition: 'width 0.3s ease',
-                animation: loadingCatalog ? 'shimmer 1.2s infinite' : 'none',
+                borderRadius: 2,
+                animation: 'shimmer 1.2s infinite',
               }} />
             </div>
           </div>
@@ -682,20 +643,7 @@ export default function DeckSuggestions({ userCollection }) {
           </div>
         )}
 
-        {/* Skeleton while scoring */}
-        {scoring && scoredDecks.length === 0 && rawDecks.length > 0 && (
-          <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-            {Array.from({ length: Math.min(10, rawDecks.length) }).map((_, i) => (
-              <div key={i} style={{
-                background: '#0d0f1e', border: '1px solid #181a2a',
-                borderRadius: 10, height: 76,
-                animation: `shimmer ${1 + i * 0.05}s ease-in-out infinite`,
-              }} />
-            ))}
-          </div>
-        )}
-
-        {/* Deck list */}
+{/* Deck list */}
         {!loadingCatalog && displayDecks.length > 0 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
             {displayDecks.map((deck, i) => (
