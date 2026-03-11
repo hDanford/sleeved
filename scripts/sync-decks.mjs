@@ -1,7 +1,7 @@
 // scripts/sync-decks.mjs
 // Scrapes MTGGoldfish (standard, modern, pioneer) + EDHREC (commander)
 // Writes to Firestore: meta_decks/{format}/decks/{deckId}
-// Writes to Storage:   decks/all-decks.json (backup)
+// Writes to Storage:   decks/all-decks.json (optional backup — skipped if bucket missing)
 
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
@@ -27,7 +27,6 @@ const storageBucket = getStorage().bucket();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Plain browser headers for MTGGoldfish (needs to look like a real browser)
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
   'Accept-Language': 'en-US,en;q=0.9',
@@ -54,14 +53,11 @@ async function fetchHtml(url, extraHeaders = {}, retries = 3) {
   }
 }
 
-// EDHREC works with a plain fetch — no special headers (confirmed by open source tools).
-// Adding fake browser headers can actually trigger Cloudflare bot detection.
+// EDHREC works with plain fetch (no headers) — confirmed by open source tooling
 async function fetchJsonPlain(url, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await fetch(url, {
-        signal: AbortSignal.timeout(20000),
-      });
+      const res = await fetch(url, { signal: AbortSignal.timeout(20000) });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       return await res.json();
     } catch (e) {
@@ -86,31 +82,19 @@ function inferColors(name) {
   if (/mono[- ]?green/.test(n)) return ['G'];
   const colors = new Set();
   const add = (...cs) => cs.forEach((c) => colors.add(c));
-  if (/azorius/.test(n)) add('W','U');
-  if (/dimir/.test(n)) add('U','B');
-  if (/rakdos/.test(n)) add('B','R');
-  if (/gruul/.test(n)) add('R','G');
-  if (/selesnya/.test(n)) add('G','W');
-  if (/orzhov/.test(n)) add('W','B');
-  if (/izzet/.test(n)) add('U','R');
-  if (/simic/.test(n)) add('G','U');
-  if (/boros/.test(n)) add('R','W');
-  if (/golgari/.test(n)) add('B','G');
-  if (/esper/.test(n)) add('W','U','B');
-  if (/grixis/.test(n)) add('U','B','R');
-  if (/jund/.test(n)) add('B','R','G');
-  if (/naya/.test(n)) add('R','G','W');
-  if (/bant/.test(n)) add('G','W','U');
-  if (/abzan/.test(n)) add('W','B','G');
-  if (/jeskai/.test(n)) add('U','R','W');
-  if (/sultai/.test(n)) add('B','G','U');
-  if (/mardu/.test(n)) add('R','W','B');
-  if (/temur/.test(n)) add('G','U','R');
+  if (/azorius/.test(n)) add('W','U'); if (/dimir/.test(n)) add('U','B');
+  if (/rakdos/.test(n)) add('B','R'); if (/gruul/.test(n)) add('R','G');
+  if (/selesnya/.test(n)) add('G','W'); if (/orzhov/.test(n)) add('W','B');
+  if (/izzet/.test(n)) add('U','R'); if (/simic/.test(n)) add('G','U');
+  if (/boros/.test(n)) add('R','W'); if (/golgari/.test(n)) add('B','G');
+  if (/esper/.test(n)) add('W','U','B'); if (/grixis/.test(n)) add('U','B','R');
+  if (/jund/.test(n)) add('B','R','G'); if (/naya/.test(n)) add('R','G','W');
+  if (/bant/.test(n)) add('G','W','U'); if (/abzan/.test(n)) add('W','B','G');
+  if (/jeskai/.test(n)) add('U','R','W'); if (/sultai/.test(n)) add('B','G','U');
+  if (/mardu/.test(n)) add('R','W','B'); if (/temur/.test(n)) add('G','U','R');
   if (/domain|5c|five.col/.test(n)) add('W','U','B','R','G');
-  if (/white|angel/.test(n)) add('W');
-  if (/blue|merfolk|wizard/.test(n)) add('U');
-  if (/black|zombie|vampire/.test(n)) add('B');
-  if (/red|burn|goblin/.test(n)) add('R');
+  if (/white|angel/.test(n)) add('W'); if (/blue|merfolk|wizard/.test(n)) add('U');
+  if (/black|zombie|vampire/.test(n)) add('B'); if (/red|burn|goblin/.test(n)) add('R');
   if (/green|elf|ramp|tron/.test(n)) add('G');
   return ['W','U','B','R','G'].filter((c) => colors.has(c));
 }
@@ -127,20 +111,15 @@ function inferStrategy(name) {
 }
 
 // ── MTGGoldfish scraper ───────────────────────────────────────────────────────
-// MTGGoldfish uses single-quoted HTML attributes throughout.
 
 function parseArchetypeLinks(html) {
   const seen = new Map();
-  // Match both single and double quoted href attributes
+  // MTGGoldfish uses single-quoted attributes — match both quote styles
   const re = /href=['"]\/archetype\/([^'"#?\/\s]{2,})['"][^>]*>([\s\S]*?)<\/a>/g;
   for (const m of html.matchAll(re)) {
     const slug = m[1].trim();
     const name = stripHtml(m[2]);
-    if (
-      name.length >= 3 &&
-      name.length <= 80 &&
-      !/^(all|budget|format|metagame|more|home)$/i.test(slug)
-    ) {
+    if (name.length >= 3 && name.length <= 80 && !/^(all|budget|format|metagame|more|home)$/i.test(slug)) {
       seen.set(slug, name);
     }
   }
@@ -149,27 +128,66 @@ function parseArchetypeLinks(html) {
 
 function parseDeckList(html) {
   const cards = [];
-  const start = html.indexOf('deck-view-deck-table');
-  if (start === -1) return null;
-  const end = html.indexOf('</table>', start);
-  const table = html.slice(start, end + 8);
-  let section = 'mainboard';
 
-  for (const row of table.split(/<tr[\s>]/)) {
-    if (row.includes('deck-category-header')) {
-      const text = row.replace(/<[^>]+>/g, ' ').toLowerCase();
-      if (text.includes('sideboard')) { section = 'sideboard'; continue; }
-      if (text.includes('land')) { section = 'land'; continue; }
-      section = 'mainboard';
-      continue;
+  // MTGGoldfish deck pages embed the canonical decklist as a CSV download link
+  // AND as a visible table. We try the table first, then fall back to the
+  // inline text representation.
+
+  // --- Strategy 1: standard deck table ---
+  const tableStart = html.indexOf('deck-view-deck-table');
+  if (tableStart !== -1) {
+    const tableEnd = html.indexOf('</table>', tableStart);
+    const table = html.slice(tableStart, tableEnd + 8);
+    let section = 'mainboard';
+
+    for (const row of table.split(/<tr[\s>]/)) {
+      if (row.includes('deck-category-header')) {
+        const text = row.replace(/<[^>]+>/g, ' ').toLowerCase();
+        if (text.includes('sideboard')) { section = 'sideboard'; continue; }
+        if (text.includes('land')) { section = 'land'; continue; }
+        section = 'mainboard';
+        continue;
+      }
+      // qty: look for the number inside the qty cell
+      const qty = row.match(/deck-col-qty[^>]*>\s*(\d+)/);
+      // name: grab everything inside deck-col-card cell and strip tags
+      const nameCell = row.match(/deck-col-card[^>]*>([\s\S]*?)(?:<\/td>|$)/);
+      if (qty && nameCell) {
+        const name = stripHtml(nameCell[1]);
+        if (name.length > 1) cards.push({ name, quantity: parseInt(qty[1]), section });
+      }
     }
-    const qty = row.match(/deck-col-qty[^>]*>\s*(\d+)/);
-    const nameCell = row.match(/deck-col-card[^>]*>([\s\S]*?)(?:<\/td>|$)/);
-    if (qty && nameCell) {
-      const name = stripHtml(nameCell[1]);
-      if (name.length > 1) cards.push({ name, quantity: parseInt(qty[1]), section });
+    if (cards.length >= 4) return cards;
+  }
+
+  // --- Strategy 2: look for the deck export text block ---
+  // MTGGoldfish embeds a plain text decklist inside a <textarea> or similar
+  const textareaMatch = html.match(/<textarea[^>]*>([\s\S]*?)<\/textarea>/i);
+  if (textareaMatch) {
+    const lines = textareaMatch[1].split('\n');
+    let section = 'mainboard';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed) { section = 'sideboard'; continue; }
+      const cardLine = trimmed.match(/^(\d+)\s+(.+)$/);
+      if (cardLine) {
+        cards.push({ name: cardLine[2].trim(), quantity: parseInt(cardLine[1]), section });
+      }
+    }
+    if (cards.length >= 4) return cards;
+  }
+
+  // --- Strategy 3: scan the whole page for qty + card-name link patterns ---
+  // This catches any layout variation
+  const cardLinkRe = /(?:^|\s)(\d+)\s*<[^>]*\/cards\/[^>]*>([^<]{2,50})<\/a>/gm;
+  for (const m of html.matchAll(cardLinkRe)) {
+    const qty = parseInt(m[1]);
+    const name = m[2].trim().replace(/&amp;/g, '&');
+    if (qty >= 1 && qty <= 30 && name.length > 1) {
+      cards.push({ name, quantity: qty, section: 'mainboard' });
     }
   }
+
   return cards.length >= 4 ? cards : null;
 }
 
@@ -210,6 +228,28 @@ async function scrapeMTGGoldfish() {
       continue;
     }
 
+    // Debug: fetch the first deck page and log what we find
+    const firstSlug = archetypes[0].slug;
+    console.log(`  [${format}] Debug: fetching first deck page /${firstSlug}…`);
+    try {
+      const firstDeckHtml = await fetchHtml(
+        `https://www.mtggoldfish.com/archetype/${firstSlug}`,
+        { Referer: `https://www.mtggoldfish.com/metagame/${format}/full` }
+      );
+      const hasDeckTable = firstDeckHtml.includes('deck-view-deck-table');
+      const hasTextarea = firstDeckHtml.includes('<textarea');
+      const hasCardLinks = firstDeckHtml.includes('/cards/');
+      console.log(`  [${format}] First deck page — deck-table:${hasDeckTable} textarea:${hasTextarea} card-links:${hasCardLinks}`);
+      if (!hasDeckTable && !hasTextarea) {
+        // Log a snippet around "deck" to see what the page looks like
+        const idx2 = firstDeckHtml.toLowerCase().indexOf('deck');
+        console.warn(`  [${format}] Page structure near "deck":`);
+        console.warn(firstDeckHtml.slice(Math.max(0, idx2 - 30), idx2 + 300));
+      }
+    } catch (e) {
+      console.warn(`  [${format}] Could not fetch first deck page: ${e.message}`);
+    }
+
     let count = 0;
     for (const { slug, name } of archetypes) {
       await sleep(800);
@@ -243,16 +283,13 @@ async function scrapeMTGGoldfish() {
 }
 
 // ── EDHREC scraper ────────────────────────────────────────────────────────────
-// Uses plain fetch with no headers — confirmed working by open source EDHREC tools.
-// The commanders list endpoint can 403 on known CI IPs, so we fall back to
-// scraping the HTML page for commander slugs if needed.
 
 function formatCommanderSlug(name) {
   return name.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, '-');
 }
 
 async function getCommanderSlugs(limit) {
-  // Attempt 1: JSON API (works outside of CI environments)
+  // Attempt 1: plain JSON API (no headers — works outside CI)
   try {
     const data = await fetchJsonPlain('https://json.edhrec.com/pages/commanders.json');
     const commanders = [];
@@ -276,17 +313,14 @@ async function getCommanderSlugs(limit) {
     console.warn(`  JSON API failed (${e.message}), trying HTML fallback…`);
   }
 
-  // Attempt 2: Scrape the HTML commanders page
+  // Attempt 2: parse __NEXT_DATA__ from the EDHREC commanders HTML page
   try {
-    const html = await fetchHtml('https://edhrec.com/commanders', {
-      Referer: 'https://edhrec.com/',
-    });
+    const html = await fetchHtml('https://edhrec.com/commanders', { Referer: 'https://edhrec.com/' });
     const commanders = [];
-    // EDHREC HTML embeds commander data in a __NEXT_DATA__ JSON script tag
+
     const nextDataMatch = html.match(/<script id="__NEXT_DATA__"[^>]*>([\s\S]*?)<\/script>/);
     if (nextDataMatch) {
       const nextData = JSON.parse(nextDataMatch[1]);
-      // Walk the props tree to find cardviews
       const cards = nextData?.props?.pageProps?.data?.container?.json_dict?.cardlists ?? [];
       for (const list of cards) {
         for (const card of list?.cardviews ?? []) {
@@ -301,9 +335,9 @@ async function getCommanderSlugs(limit) {
       }
     }
 
-    // Also try plain href scraping as last resort
+    // Plain href scraping as last resort
     if (commanders.length === 0) {
-      for (const m of html.matchAll(/href=['"]\/commanders\/([^'"?\s]+)['"]/g)) {
+      for (const m of html.matchAll(/href=['"]\/commanders\/([^'"?\s\/]+)['"]/g)) {
         const slug = m[1].trim();
         if (slug && !commanders.find(c => c.slug === slug)) {
           commanders.push({ name: slug.replace(/-/g, ' '), slug, colorIdentity: [], rank: 9999 });
@@ -338,14 +372,9 @@ async function scrapeEDHREC(limit = 1000) {
     const commander = commanders[i];
     await sleep(400);
     try {
-      // Plain fetch — no headers, matching how open source EDHREC tools work
       const deckData = await fetchJsonPlain(
         `https://json.edhrec.com/pages/commanders/${commander.slug}.json`
       );
-
-      // Use the exact JSON path confirmed by edhrec_json_to_txt source code:
-      // json_data["container"]["json_dict"]["cardlists"][n]["header"]
-      // json_data["container"]["json_dict"]["cardlists"][n]["cardviews"][n]["name"]
       const dict = deckData?.container?.json_dict;
       if (!dict) continue;
 
@@ -353,7 +382,7 @@ async function scrapeEDHREC(limit = 1000) {
       const keyCards = [{ name: commanderName, quantity: 1, section: 'commander' }];
 
       for (const list of dict?.cardlists ?? []) {
-        // Use "header" (confirmed key) to determine section; fall back to "tag"
+        // "header" confirmed as the section key from edhrec_json_to_txt source code
         const header = (list?.header ?? list?.tag ?? '').toLowerCase();
         const section = header.includes('land') ? 'land' : 'mainboard';
         for (const card of list?.cardviews ?? []) {
@@ -375,7 +404,7 @@ async function scrapeEDHREC(limit = 1000) {
         keyCards,
         syncedAt: new Date().toISOString(),
       });
-    } catch (_) { /* skip individual failures */ }
+    } catch (_) { /* skip */ }
 
     if ((i + 1) % 100 === 0) console.log(`  ${i + 1}/${commanders.length} (${all.length} decks)`);
   }
@@ -412,19 +441,25 @@ async function writeToFirestore(allDecks) {
   }
 }
 
-// ── Write to Firebase Storage ─────────────────────────────────────────────────
+// ── Write to Firebase Storage (optional) ─────────────────────────────────────
 
 async function writeToStorage(allDecks) {
   console.log('\n── Writing backup to Storage ──');
-  const json = JSON.stringify(allDecks);
-  console.log(`  Size: ${(Buffer.byteLength(json) / 1024 / 1024).toFixed(1)} MB`);
-  const file = storageBucket.file('decks/all-decks.json');
-  await file.save(json, {
-    contentType: 'application/json',
-    metadata: { cacheControl: 'public, max-age=86400', generatedAt: new Date().toISOString() },
-  });
-  await file.makePublic();
-  console.log(`  Uploaded to gs://${bucketName}/decks/all-decks.json`);
+  try {
+    const json = JSON.stringify(allDecks);
+    console.log(`  Size: ${(Buffer.byteLength(json) / 1024 / 1024).toFixed(1)} MB`);
+    const file = storageBucket.file('decks/all-decks.json');
+    await file.save(json, {
+      contentType: 'application/json',
+      metadata: { cacheControl: 'public, max-age=86400', generatedAt: new Date().toISOString() },
+    });
+    await file.makePublic();
+    console.log(`  Uploaded to gs://${bucketName}/decks/all-decks.json`);
+  } catch (e) {
+    // Storage is optional — Firestore is the source of truth
+    console.warn(`  Storage upload skipped: ${e.message}`);
+    console.warn(`  (Check that Firebase Storage is enabled and FIREBASE_STORAGE_BUCKET is correct)`);
+  }
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
@@ -446,7 +481,7 @@ async function main() {
   }
 
   await writeToFirestore(allDecks);
-  await writeToStorage(allDecks);
+  await writeToStorage(allDecks); // non-fatal if bucket missing
   console.log('\nDeck sync complete.');
 }
 
