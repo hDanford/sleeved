@@ -171,7 +171,7 @@ async function fetchArchidektCommanderDecks(maxDecks = 500) {
   let total = Infinity;
 
   while (allListings.length < maxDecks && allListings.length < total) {
-    const url = `https://archidekt.com/api/decks/cards/?formats=3&orderBy=-viewCount&pageSize=${pageSize}&page=${page}`;
+    const url = `https://archidekt.com/api/decks/?formats=3&orderBy=-viewCount&pageSize=${pageSize}&page=${page}`;
     let data;
     try {
       data = await fetchJson(url, archidektHeaders);
