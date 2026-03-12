@@ -1,14 +1,12 @@
 // scripts/sync-decks.mjs
-// Pulls top Commander data from EDHREC's static JSON files and writes to Firestore.
+// Pulls Commander recommendations from EDHREC's per-commander JSON pages
+// and writes to Firestore.
 //
-// Strategy:
-//   1. Fetch https://json.edhrec.com/pages/commanders.json
-//      → find the cardlist with tag "topcommanders" → list of commander slugs
-//   2. For each commander slug, fetch
-//      https://json.edhrec.com/pages/commanders/{slug}.json
-//      → extract recommended cards (keyCards) + commander metadata
-//   3. Write each result as a deck doc to Firestore at:
-//      meta_decks/commander/decks/{deckId}
+// The top commanders list is seeded here (EDHREC's listing endpoint blocks
+// server-side requests). The slugs are just lowercase hyphenated card names,
+// so this list is easy to update. Card data is refreshed nightly from EDHREC.
+//
+// Firestore path: meta_decks/commander/decks/{deckId}
 //
 // Required GitHub secrets:
 //   FIREBASE_SERVICE_ACCOUNT  — contents of your Firebase service account JSON
@@ -17,6 +15,122 @@
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
 import { getStorage } from 'firebase-admin/storage';
+
+// ── Top commanders seed list ──────────────────────────────────────────────────
+// Slugs = lowercase, hyphenated card name (same as EDHREC URL).
+// Update this list occasionally as the meta shifts.
+// Current top commanders as of early 2026 (EDHREC 2-year rankings).
+
+const TOP_COMMANDERS = [
+  // Tier 1 — all-time most popular
+  { name: 'Atraxa, Praetors\' Voice',       slug: 'atraxa-praetors-voice' },
+  { name: 'Kenrith, the Returned King',      slug: 'kenrith-the-returned-king' },
+  { name: 'Edgar Markov',                    slug: 'edgar-markov' },
+  { name: 'Miirym, Sentinel Wyrm',           slug: 'miirym-sentinel-wyrm' },
+  { name: 'Ur-Dragon, the',                  slug: 'the-ur-dragon' },
+  { name: 'Krenko, Mob Boss',                slug: 'krenko-mob-boss' },
+  { name: 'Muldrotha, the Gravetide',        slug: 'muldrotha-the-gravetide' },
+  { name: 'Prossh, Skyraider of Kher',       slug: 'prossh-skyraider-of-kher' },
+  { name: 'Teferi, Temporal Archmage',       slug: 'teferi-temporal-archmage' },
+  { name: 'Nekusar, the Mindrazer',          slug: 'nekusar-the-mindrazer' },
+  { name: 'Meren of Clan Nel Toth',          slug: 'meren-of-clan-nel-toth' },
+  { name: 'Yuriko, the Tiger\'s Shadow',     slug: 'yuriko-the-tigers-shadow' },
+  { name: 'Oloro, Ageless Ascetic',          slug: 'oloro-ageless-ascetic' },
+  { name: 'Kaalia of the Vast',              slug: 'kaalia-of-the-vast' },
+  { name: 'Azusa, Lost but Seeking',         slug: 'azusa-lost-but-seeking' },
+  { name: 'Zur the Enchanter',               slug: 'zur-the-enchanter' },
+  { name: 'Riku of Two Reflections',         slug: 'riku-of-two-reflections' },
+  { name: 'Sliver Overlord',                 slug: 'sliver-overlord' },
+  { name: 'Animar, Soul of Elements',        slug: 'animar-soul-of-elements' },
+  { name: 'Mizzix of the Izmagnus',          slug: 'mizzix-of-the-izmagnus' },
+
+  // Tier 2 — consistently popular
+  { name: 'Lathril, Blade of the Elves',     slug: 'lathril-blade-of-the-elves' },
+  { name: 'Yennet, Cryptic Sovereign',       slug: 'yennet-cryptic-sovereign' },
+  { name: 'Wilhelt, the Rotcleaver',         slug: 'wilhelt-the-rotcleaver' },
+  { name: 'Shorikai, Genesis Engine',        slug: 'shorikai-genesis-engine' },
+  { name: 'Chulane, Teller of Tales',        slug: 'chulane-teller-of-tales' },
+  { name: 'Isshin, Two Heavens as One',      slug: 'isshin-two-heavens-as-one' },
+  { name: 'Winota, Joiner of Forces',        slug: 'winota-joiner-of-forces' },
+  { name: 'Veyran, Voice of Duality',        slug: 'veyran-voice-of-duality' },
+  { name: 'Sefris of the Hidden Ways',       slug: 'sefris-of-the-hidden-ways' },
+  { name: 'Ghave, Guru of Spores',           slug: 'ghave-guru-of-spores' },
+  { name: 'Omnath, Locus of Creation',       slug: 'omnath-locus-of-creation' },
+  { name: 'Omnath, Locus of Rage',           slug: 'omnath-locus-of-rage' },
+  { name: 'Tergrid, God of Fright',          slug: 'tergrid-god-of-fright' },
+  { name: 'Syr Konrad, the Grim',            slug: 'syr-konrad-the-grim' },
+  { name: 'Korvold, Fae-Cursed King',        slug: 'korvold-fae-cursed-king' },
+  { name: 'Rograkh, Son of Rohgahh',         slug: 'rograkh-son-of-rohgahh' },
+  { name: 'Obeka, Brute Chronologist',       slug: 'obeka-brute-chronologist' },
+  { name: 'Gallia of the Endless Dance',     slug: 'gallia-of-the-endless-dance' },
+  { name: 'Scion of the Ur-Dragon',          slug: 'scion-of-the-ur-dragon' },
+  { name: 'Morophon, the Boundless',         slug: 'morophon-the-boundless' },
+  { name: 'Zirda, the Dawnwaker',            slug: 'zirda-the-dawnwaker' },
+  { name: 'Inalla, Archmage Ritualist',      slug: 'inalla-archmage-ritualist' },
+  { name: 'Nicol Bolas, the Ravager',        slug: 'nicol-bolas-the-ravager' },
+  { name: 'Xenagos, God of Revels',          slug: 'xenagos-god-of-revels' },
+  { name: 'Ezuri, Claw of Progress',         slug: 'ezuri-claw-of-progress' },
+  { name: 'Brago, King Eternal',             slug: 'brago-king-eternal' },
+  { name: 'Breya, Etherium Shaper',          slug: 'breya-etherium-shaper' },
+  { name: 'Marrow-Gnawer',                   slug: 'marrow-gnawer' },
+  { name: 'Sliver Hivelord',                 slug: 'sliver-hivelord' },
+  { name: 'Child of Alara',                  slug: 'child-of-alara' },
+
+  // Recent meta commanders
+  { name: 'Elminster',                       slug: 'elminster' },
+  { name: 'Tameshi, Reality Architect',      slug: 'tameshi-reality-architect' },
+  { name: 'Tasha, the Witch Queen',          slug: 'tasha-the-witch-queen' },
+  { name: 'Lolth, Spider Queen',             slug: 'lolth-spider-queen' },
+  { name: 'Raphael, Fiendish Savior',        slug: 'raphael-fiendish-savior' },
+  { name: 'Jarad, Golgari Lich Lord',        slug: 'jarad-golgari-lich-lord' },
+  { name: 'Niv-Mizzet, Parun',              slug: 'niv-mizzet-parun' },
+  { name: 'Niv-Mizzet Reborn',              slug: 'niv-mizzet-reborn' },
+  { name: 'Zaxara, the Exemplary',           slug: 'zaxara-the-exemplary' },
+  { name: 'Otrimi, the Ever-Playful',        slug: 'otrimi-the-ever-playful' },
+  { name: 'Araumi of the Dead Tide',         slug: 'araumi-of-the-dead-tide' },
+  { name: 'Livio, Oathsworn Sentinel',       slug: 'livio-oathsworn-sentinel' },
+  { name: 'Liesa, Shroud of Dusk',           slug: 'liesa-shroud-of-dusk' },
+  { name: 'Shanid, Sleepers\' Scourge',      slug: 'shanid-sleepers-scourge' },
+  { name: 'Sheoldred, the Apocalypse',       slug: 'sheoldred-the-apocalypse' },
+  { name: 'Baral, Chief of Compliance',      slug: 'baral-chief-of-compliance' },
+  { name: 'Gishath, Sun\'s Avatar',          slug: 'gishath-suns-avatar' },
+  { name: 'Imoti, Celebrant of Bounty',      slug: 'imoti-celebrant-of-bounty' },
+  { name: 'Hamza, Guardian of Arashin',      slug: 'hamza-guardian-of-arashin' },
+  { name: 'Alaundo the Seer',               slug: 'alaundo-the-seer' },
+  { name: 'Narset, Enlightened Master',      slug: 'narset-enlightened-master' },
+  { name: 'Tasigur, the Golden Fang',        slug: 'tasigur-the-golden-fang' },
+  { name: 'Marchesa, the Black Rose',        slug: 'marchesa-the-black-rose' },
+  { name: 'Sidisi, Brood Tyrant',            slug: 'sidisi-brood-tyrant' },
+  { name: 'Oona, Queen of the Fae',          slug: 'oona-queen-of-the-fae' },
+  { name: 'Grenzo, Dungeon Warden',          slug: 'grenzo-dungeon-warden' },
+  { name: 'Siona, Captain of the Pyleas',    slug: 'siona-captain-of-the-pyleas' },
+  { name: 'Yawgmoth, Thran Physician',       slug: 'yawgmoth-thran-physician' },
+  { name: 'Kozilek, Butcher of Truth',       slug: 'kozilek-butcher-of-truth' },
+  { name: 'Kykar, Wind\'s Fury',             slug: 'kykar-winds-fury' },
+  { name: 'Yarok, the Desecrated',           slug: 'yarok-the-desecrated' },
+  { name: 'Golos, Tireless Pilgrim',         slug: 'golos-tireless-pilgrim' },
+  { name: 'Kenrith, the Returned King',      slug: 'kenrith-the-returned-king' },
+  { name: 'Tymna the Weaver',               slug: 'tymna-the-weaver' },
+  { name: 'Thrasios, Triton Hero',           slug: 'thrasios-triton-hero' },
+  { name: 'Codie, Vociferous Codex',         slug: 'codie-vociferous-codex' },
+  { name: 'Tevesh Szat, Doom of Fools',      slug: 'tevesh-szat-doom-of-fools' },
+  { name: 'Kodama of the East Tree',         slug: 'kodama-of-the-east-tree' },
+  { name: 'Dargo, the Shipwrecker',          slug: 'dargo-the-shipwrecker' },
+  { name: 'Prosper, Tome-Bound',             slug: 'prosper-tome-bound' },
+  { name: 'Burakos, Party Leader',           slug: 'burakos-party-leader' },
+  { name: 'Lonis, Cryptozoologist',          slug: 'lonis-cryptozoologist' },
+  { name: 'Silvar, Danse Macabre',           slug: 'silvar-danse-macabre' },
+  { name: 'Pako, Arcane Retriever',          slug: 'pako-arcane-retriever' },
+  { name: 'Haldan, Avid Arcanist',           slug: 'haldan-avid-arcanist' },
+  { name: 'Magda, Brazen Outlaw',            slug: 'magda-brazen-outlaw' },
+  { name: 'Rebbec, Architect of Ascension',  slug: 'rebbec-architect-of-ascension' },
+  { name: 'Tormod, the Desecrator',          slug: 'tormod-the-desecrator' },
+  { name: 'Blex, Vexing Pest',              slug: 'blex-vexing-pest' },
+  { name: 'Strefan, Maurer Progenitor',      slug: 'strefan-maurer-progenitor' },
+  { name: 'Runo Stromkirk',                  slug: 'runo-stromkirk' },
+  { name: 'Toxrill, the Corrosive',          slug: 'toxrill-the-corrosive' },
+  { name: 'Olivia, Crimson Bride',           slug: 'olivia-crimson-bride' },
+];
 
 // ── Firebase init ─────────────────────────────────────────────────────────────
 
@@ -66,44 +180,14 @@ function inferStrategy(name) {
   return 'midrange';
 }
 
-// Convert EDHREC color_identity strings to W/U/B/R/G symbols
 const COLOR_MAP = { W: 'W', U: 'U', B: 'B', R: 'R', G: 'G' };
 function normalizeColors(colorIdentity) {
   if (!Array.isArray(colorIdentity)) return [];
   return colorIdentity.map((c) => COLOR_MAP[c?.toUpperCase()] ?? c).filter(Boolean);
 }
 
-// ── EDHREC fetching ───────────────────────────────────────────────────────────
+// ── EDHREC per-commander fetch ────────────────────────────────────────────────
 
-// Fetch the top commanders list from EDHREC.
-// Returns Array<{ name, slug, numDecks }>
-async function fetchTopCommanders(limit = 100) {
-  console.log('  Fetching top commanders from EDHREC...');
-  const data = await fetchJson('https://json.edhrec.com/pages/commanders.json');
-
-  const cardlists = data?.container?.json_dict?.cardlists ?? [];
-  const topList = cardlists.find((cl) => cl.tag === 'topcommanders');
-
-  if (!topList) {
-    // Fallback: use first cardlist if tag structure differs
-    console.warn('  Warning: no "topcommanders" tag found, using first cardlist');
-    const fallback = cardlists[0]?.cardviews ?? [];
-    return fallback.slice(0, limit).map((c) => ({
-      name: c.name,
-      slug: c.sanitized ?? c.sanitized_wo,
-      numDecks: c.num_decks ?? 0,
-    }));
-  }
-
-  return topList.cardviews.slice(0, limit).map((c) => ({
-    name: c.name,
-    slug: c.sanitized ?? c.sanitized_wo,
-    numDecks: c.num_decks ?? 0,
-  }));
-}
-
-// Fetch a single commander's EDHREC page and extract their recommended cards.
-// Returns { keyCards, colors, numDecks } or null on failure.
 async function fetchCommanderPage(slug) {
   const url = `https://json.edhrec.com/pages/commanders/${slug}.json`;
   try {
@@ -111,13 +195,10 @@ async function fetchCommanderPage(slug) {
     const jsonDict = data?.container?.json_dict ?? {};
     const cardlists = jsonDict?.cardlists ?? [];
 
-    // Commander's own metadata (color identity etc.)
     const commanderCard = jsonDict?.card ?? {};
     const colors = normalizeColors(commanderCard?.color_identity);
     const numDecks = commanderCard?.num_decks ?? 0;
 
-    // Collect all recommended cards across every cardlist section
-    // (High Synergy, Creatures, Instants, Lands, etc.)
     const keyCards = [];
     const seen = new Set();
 
@@ -137,29 +218,30 @@ async function fetchCommanderPage(slug) {
 
     return { keyCards, colors, numDecks };
   } catch (e) {
-    console.warn(`  Failed to fetch commander page for "${slug}": ${e.message}`);
+    console.warn(`  Failed "${slug}": ${e.message}`);
     return null;
   }
 }
 
 // ── Main sync ─────────────────────────────────────────────────────────────────
 
-async function syncCommander(limit = 100) {
+async function syncCommander() {
   console.log('\n-- EDHREC Commander Sync --');
+  console.log(`  Processing ${TOP_COMMANDERS.length} commanders from seed list...`);
 
-  const topCommanders = await fetchTopCommanders(limit);
-  console.log(`  Found ${topCommanders.length} top commanders`);
-
-  if (!topCommanders.length) {
-    console.error('  No commanders found -- aborting.');
-    return [];
-  }
+  // Deduplicate seed list by slug
+  const seen = new Set();
+  const commanders = TOP_COMMANDERS.filter(({ slug }) => {
+    if (seen.has(slug)) return false;
+    seen.add(slug);
+    return true;
+  });
 
   const allDecks = [];
   let fetched = 0;
   let failed = 0;
 
-  for (const commander of topCommanders) {
+  for (const commander of commanders) {
     await sleep(400);
 
     const result = await fetchCommanderPage(commander.slug);
@@ -177,7 +259,7 @@ async function syncCommander(limit = 100) {
       format: 'commander',
       strategy: inferStrategy(commander.name),
       colors: result.colors,
-      viewCount: result.numDecks ?? commander.numDecks,
+      viewCount: result.numDecks,
       owner: null,
       description: `Top recommended cards for ${commander.name} commander decks, based on EDHREC data.`,
       keyCards: result.keyCards,
@@ -187,7 +269,7 @@ async function syncCommander(limit = 100) {
 
     fetched++;
     if (fetched % 25 === 0) {
-      console.log(`  ${fetched}/${topCommanders.length} commanders fetched`);
+      console.log(`  ${fetched}/${commanders.length} done`);
     }
   }
 
@@ -241,7 +323,7 @@ async function writeToStorage(allDecks) {
 async function main() {
   console.log(`Deck sync started at ${new Date().toISOString()}`);
 
-  const allDecks = await syncCommander(100);
+  const allDecks = await syncCommander();
 
   if (!allDecks.length) {
     console.error('No decks collected -- aborting.');
