@@ -1,15 +1,18 @@
 // scripts/sync-decks.mjs
-// Pulls top Commander decks from Archidekt, enriches each with EDHREC
-// card suggestions for that commander, and writes to Firestore.
+// Pulls top Commander data from EDHREC's static JSON files and writes to Firestore.
 //
-// Firestore path: meta_decks/commander/decks/{deckId}
+// Strategy:
+//   1. Fetch https://json.edhrec.com/pages/commanders.json
+//      → find the cardlist with tag "topcommanders" → list of commander slugs
+//   2. For each commander slug, fetch
+//      https://json.edhrec.com/pages/commanders/{slug}.json
+//      → extract recommended cards (keyCards) + commander metadata
+//   3. Write each result as a deck doc to Firestore at:
+//      meta_decks/commander/decks/{deckId}
 //
-// Each stored deck has:
-//   keyCards[]        - actual cards from the Archidekt deck
-//   edhrecSuggestions[] - EDHREC-recommended cards NOT already in the deck
-//   commander         - commander card name
-//   source            - 'Archidekt'
-//   sourceUrl         - link to the Archidekt deck
+// Required GitHub secrets:
+//   FIREBASE_SERVICE_ACCOUNT  — contents of your Firebase service account JSON
+//   FIREBASE_STORAGE_BUCKET   — e.g. "your-project.firebasestorage.app"
 
 import { initializeApp, cert } from 'firebase-admin/app';
 import { getFirestore } from 'firebase-admin/firestore';
@@ -35,14 +38,11 @@ const storageBucket = getStorage().bucket();
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// Archidekt needs a realistic User-Agent; EDHREC works plain
-const BROWSER_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36';
-
-async function fetchJson(url, headers = {}, retries = 3) {
+async function fetchJson(url, retries = 3) {
   for (let i = 0; i < retries; i++) {
     try {
       const res = await fetch(url, {
-        headers: { 'Accept': 'application/json', ...headers },
+        headers: { 'Accept': 'application/json' },
         signal: AbortSignal.timeout(20000),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status} — ${url}`);
@@ -56,34 +56,8 @@ async function fetchJson(url, headers = {}, retries = 3) {
 
 // ── Color / strategy inference ────────────────────────────────────────────────
 
-function inferColors(name) {
-  const n = name.toLowerCase();
-  if (/mono[- ]?white/.test(n)) return ['W'];
-  if (/mono[- ]?blue/.test(n)) return ['U'];
-  if (/mono[- ]?black/.test(n)) return ['B'];
-  if (/mono[- ]?red/.test(n)) return ['R'];
-  if (/mono[- ]?green/.test(n)) return ['G'];
-  const colors = new Set();
-  const add = (...cs) => cs.forEach((c) => colors.add(c));
-  if (/azorius/.test(n)) add('W','U'); if (/dimir/.test(n)) add('U','B');
-  if (/rakdos/.test(n)) add('B','R'); if (/gruul/.test(n)) add('R','G');
-  if (/selesnya/.test(n)) add('G','W'); if (/orzhov/.test(n)) add('W','B');
-  if (/izzet/.test(n)) add('U','R'); if (/simic/.test(n)) add('G','U');
-  if (/boros/.test(n)) add('R','W'); if (/golgari/.test(n)) add('B','G');
-  if (/esper/.test(n)) add('W','U','B'); if (/grixis/.test(n)) add('U','B','R');
-  if (/jund/.test(n)) add('B','R','G'); if (/naya/.test(n)) add('R','G','W');
-  if (/bant/.test(n)) add('G','W','U'); if (/abzan/.test(n)) add('W','B','G');
-  if (/jeskai/.test(n)) add('U','R','W'); if (/sultai/.test(n)) add('B','G','U');
-  if (/mardu/.test(n)) add('R','W','B'); if (/temur/.test(n)) add('G','U','R');
-  if (/domain|5c|five.col/.test(n)) add('W','U','B','R','G');
-  if (/white|angel/.test(n)) add('W'); if (/blue|merfolk|wizard/.test(n)) add('U');
-  if (/black|zombie|vampire/.test(n)) add('B'); if (/red|burn|goblin/.test(n)) add('R');
-  if (/green|elf|ramp|tron/.test(n)) add('G');
-  return ['W','U','B','R','G'].filter((c) => colors.has(c));
-}
-
 function inferStrategy(name) {
-  const n = name.toLowerCase();
+  const n = (name ?? '').toLowerCase();
   if (/burn|aggro|weenie|goblins|affinity|infect/.test(n)) return 'aggro';
   if (/control|stax|prison/.test(n)) return 'control';
   if (/combo|storm|breach|reanimator/.test(n)) return 'combo';
@@ -92,271 +66,141 @@ function inferStrategy(name) {
   return 'midrange';
 }
 
-// ── Archidekt scraper ─────────────────────────────────────────────────────────
-
-// Safely extract the commander name from a deck listing result.
-// The API may put it in different places depending on endpoint version.
-function extractCommanderFromListing(result) {
-  // Try commanders array (present in newer API)
-  const cmdrs = result.commanders ?? result.featured?.commanders ?? [];
-  if (Array.isArray(cmdrs) && cmdrs.length > 0) {
-    const name = cmdrs[0]?.oracleCard?.name
-      ?? cmdrs[0]?.card?.oracleCard?.name
-      ?? cmdrs[0]?.name
-      ?? null;
-    if (name) return name;
-  }
-  return null;
+// Convert EDHREC color_identity strings to W/U/B/R/G symbols
+const COLOR_MAP = { W: 'W', U: 'U', B: 'B', R: 'R', G: 'G' };
+function normalizeColors(colorIdentity) {
+  if (!Array.isArray(colorIdentity)) return [];
+  return colorIdentity.map((c) => COLOR_MAP[c?.toUpperCase()] ?? c).filter(Boolean);
 }
 
-// Parse a full deck response into a keyCards array.
-// Handles both old (categories[].cards[]) and new (cards[]) shapes.
-function parseDeckCards(deckData) {
-  const cards = [];
+// ── EDHREC fetching ───────────────────────────────────────────────────────────
 
-  // Shape 1: categories array (pyrchidekt-confirmed structure)
-  if (Array.isArray(deckData.categories)) {
-    for (const cat of deckData.categories) {
-      const catName = (cat.name ?? cat.includedInDeck ?? '').toLowerCase();
-      let section = 'mainboard';
-      if (catName === 'commander' || catName === 'commanders') section = 'commander';
-      else if (catName === 'sideboard') section = 'sideboard';
-      else if (catName.includes('land')) section = 'land';
+// Fetch the top commanders list from EDHREC.
+// Returns Array<{ name, slug, numDecks }>
+async function fetchTopCommanders(limit = 100) {
+  console.log('  Fetching top commanders from EDHREC...');
+  const data = await fetchJson('https://json.edhrec.com/pages/commanders.json');
 
-      for (const entry of cat.cards ?? []) {
-        const name = entry.card?.oracleCard?.name
-          ?? entry.card?.oracle_card?.name
-          ?? entry.card?.name
-          ?? entry.oracleCard?.name
-          ?? null;
-        if (name) {
-          cards.push({ name, quantity: entry.quantity ?? 1, section });
-        }
-      }
-    }
-    if (cards.length >= 10) return cards;
+  const cardlists = data?.container?.json_dict?.cardlists ?? [];
+  const topList = cardlists.find((cl) => cl.tag === 'topcommanders');
+
+  if (!topList) {
+    // Fallback: use first cardlist if tag structure differs
+    console.warn('  Warning: no "topcommanders" tag found, using first cardlist');
+    const fallback = cardlists[0]?.cardviews ?? [];
+    return fallback.slice(0, limit).map((c) => ({
+      name: c.name,
+      slug: c.sanitized ?? c.sanitized_wo,
+      numDecks: c.num_decks ?? 0,
+    }));
   }
 
-  // Shape 2: flat cards array (some API versions)
-  if (Array.isArray(deckData.cards)) {
-    for (const entry of deckData.cards) {
-      const name = entry.card?.oracleCard?.name
-        ?? entry.card?.oracle_card?.name
-        ?? entry.card?.name
-        ?? null;
-      const catName = (entry.categories?.[0]?.name ?? '').toLowerCase();
-      let section = 'mainboard';
-      if (catName === 'commander') section = 'commander';
-      else if (catName === 'sideboard') section = 'sideboard';
-      else if (catName.includes('land')) section = 'land';
-      if (name) cards.push({ name, quantity: entry.quantity ?? 1, section });
-    }
-    if (cards.length >= 10) return cards;
-  }
-
-  return null;
+  return topList.cardviews.slice(0, limit).map((c) => ({
+    name: c.name,
+    slug: c.sanitized ?? c.sanitized_wo,
+    numDecks: c.num_decks ?? 0,
+  }));
 }
 
-// Fetch the top N commander deck listings from Archidekt, then fetch each
-// deck's full card list. Returns: Array<{ id, name, viewCount, commander, keyCards }>.
-async function fetchArchidektCommanderDecks(maxDecks = 500) {
-  const archidektHeaders = { 'User-Agent': BROWSER_UA };
-  const allListings = [];
-
-  console.log('  Fetching deck listings from Archidekt…');
-
-  // Page through results (max pageSize seems to be 100)
-  const pageSize = 100;
-  let page = 1;
-  let total = Infinity;
-
-  while (allListings.length < maxDecks && allListings.length < total) {
-    const url = `https://archidekt.com/api/decks/?formats=3&orderBy=-viewCount&pageSize=${pageSize}&page=${page}`;
-    let data;
-    try {
-      data = await fetchJson(url, archidektHeaders);
-    } catch (e) {
-      console.warn(`  Archidekt listings page ${page} failed: ${e.message}`);
-      break;
-    }
-
-    // Log shape of first page for debugging
-    if (page === 1) {
-      total = data?.count ?? data?.total ?? Infinity;
-      const sample = data?.results?.[0];
-      console.log(`  Total available: ${total}`);
-      console.log(`  Sample result keys: ${sample ? Object.keys(sample).join(', ') : '(none)'}`);
-      if (sample?.commanders !== undefined) {
-        console.log(`  Commander field: commanders[0] =`, JSON.stringify(sample.commanders?.[0])?.slice(0, 120));
-      }
-    }
-
-    const results = data?.results ?? data?.decks ?? [];
-    if (!results.length) break;
-
-    for (const r of results) {
-      if (allListings.length >= maxDecks) break;
-      allListings.push(r);
-    }
-
-    page++;
-    await sleep(500);
-  }
-
-  console.log(`  Got ${allListings.length} deck listings`);
-
-  // Now fetch each deck's full card list
-  const decks = [];
-  let fetched = 0;
-  let failed = 0;
-
-  for (const listing of allListings) {
-    await sleep(600);
-    const id = listing.id;
-    if (!id) continue;
-
-    try {
-      const deckData = await fetchJson(
-        `https://archidekt.com/api/decks/${id}/`,
-        archidektHeaders
-      );
-
-      const keyCards = parseDeckCards(deckData);
-      if (!keyCards) {
-        // Log the shape of a failing deck once
-        if (failed === 0) {
-          console.warn(`  Debug: deck ${id} failed parsing. Top-level keys: ${Object.keys(deckData).join(', ')}`);
-        }
-        failed++;
-        continue;
-      }
-
-      // Extract commander from the full deck response (more reliable than listing)
-      const commanderCard = keyCards.find((c) => c.section === 'commander');
-      const commanderName = commanderCard?.name
-        ?? extractCommanderFromListing(listing)
-        ?? deckData.name; // fallback to deck name
-
-      decks.push({
-        id,
-        name: listing.name ?? deckData.name ?? `Deck ${id}`,
-        viewCount: listing.viewCount ?? 0,
-        commander: commanderName,
-        keyCards,
-        owner: listing.owner?.username ?? listing.createdByUser ?? null,
-      });
-
-      fetched++;
-      if (fetched % 50 === 0) console.log(`  ${fetched}/${allListings.length} decks fetched`);
-    } catch (e) {
-      failed++;
-    }
-  }
-
-  console.log(`  Fetched ${fetched} decks (${failed} failed)`);
-  return decks;
-}
-
-// ── EDHREC enrichment ─────────────────────────────────────────────────────────
-
-function formatCommanderSlug(name) {
-  return name.toLowerCase().replace(/[^a-z0-9\s]/g, '').replace(/\s+/g, '-');
-}
-
-// Fetch EDHREC recommendations for a commander.
-// Returns a Set of card names that EDHREC recommends.
-async function fetchEdhrecPool(commanderName) {
-  const slug = formatCommanderSlug(commanderName);
+// Fetch a single commander's EDHREC page and extract their recommended cards.
+// Returns { keyCards, colors, numDecks } or null on failure.
+async function fetchCommanderPage(slug) {
+  const url = `https://json.edhrec.com/pages/commanders/${slug}.json`;
   try {
-    const data = await fetchJson(`https://json.edhrec.com/pages/commanders/${slug}.json`);
-    const dict = data?.container?.json_dict;
-    if (!dict) return new Set();
+    const data = await fetchJson(url);
+    const jsonDict = data?.container?.json_dict ?? {};
+    const cardlists = jsonDict?.cardlists ?? [];
 
-    const pool = new Set();
-    for (const list of dict?.cardlists ?? []) {
+    // Commander's own metadata (color identity etc.)
+    const commanderCard = jsonDict?.card ?? {};
+    const colors = normalizeColors(commanderCard?.color_identity);
+    const numDecks = commanderCard?.num_decks ?? 0;
+
+    // Collect all recommended cards across every cardlist section
+    // (High Synergy, Creatures, Instants, Lands, etc.)
+    const keyCards = [];
+    const seen = new Set();
+
+    for (const list of cardlists) {
       for (const card of list?.cardviews ?? []) {
-        if (card?.name) pool.add(card.name);
+        if (!card?.name || seen.has(card.name)) continue;
+        seen.add(card.name);
+        keyCards.push({
+          name: card.name,
+          quantity: 1,
+          section: 'mainboard',
+          inclusion: card.inclusion ?? 0,
+          synergy: card.synergy ?? 0,
+        });
       }
     }
-    // Also add the commander itself
-    const commanderCardName = dict?.card?.name ?? commanderName;
-    pool.add(commanderCardName);
 
-    return pool;
-  } catch (_) {
-    return new Set();
+    return { keyCards, colors, numDecks };
+  } catch (e) {
+    console.warn(`  Failed to fetch commander page for "${slug}": ${e.message}`);
+    return null;
   }
 }
 
-// ── Main sync logic ───────────────────────────────────────────────────────────
+// ── Main sync ─────────────────────────────────────────────────────────────────
 
-async function syncCommander(maxDecks = 500) {
-  console.log('\n── Archidekt Commander Sync ──');
+async function syncCommander(limit = 100) {
+  console.log('\n-- EDHREC Commander Sync --');
 
-  const archidektDecks = await fetchArchidektCommanderDecks(maxDecks);
-  if (!archidektDecks.length) {
-    console.warn('  No decks fetched from Archidekt — aborting commander sync.');
+  const topCommanders = await fetchTopCommanders(limit);
+  console.log(`  Found ${topCommanders.length} top commanders`);
+
+  if (!topCommanders.length) {
+    console.error('  No commanders found -- aborting.');
     return [];
   }
 
-  // Build a map of commander → EDHREC pool (fetch once per unique commander)
-  const uniqueCommanders = [...new Set(archidektDecks.map((d) => d.commander).filter(Boolean))];
-  console.log(`\n  ${uniqueCommanders.length} unique commanders — fetching EDHREC pools…`);
-
-  const edhrecPools = new Map(); // commanderName → Set<cardName>
-  for (let i = 0; i < uniqueCommanders.length; i++) {
-    const name = uniqueCommanders[i];
-    await sleep(400);
-    const pool = await fetchEdhrecPool(name);
-    edhrecPools.set(name, pool);
-    if ((i + 1) % 50 === 0) console.log(`  EDHREC: ${i + 1}/${uniqueCommanders.length} done`);
-  }
-  console.log(`  EDHREC pools fetched`);
-
-  // Build the final deck objects
   const allDecks = [];
-  for (const deck of archidektDecks) {
-    const pool = edhrecPools.get(deck.commander) ?? new Set();
-    const deckCardNames = new Set(deck.keyCards.map((c) => c.name));
+  let fetched = 0;
+  let failed = 0;
 
-    // EDHREC suggestions = cards EDHREC recommends that are NOT already in the deck
-    const edhrecSuggestions = [...pool]
-      .filter((name) => !deckCardNames.has(name))
-      .map((name) => ({ name, quantity: 1, section: 'mainboard' }));
+  for (const commander of topCommanders) {
+    await sleep(400);
+
+    const result = await fetchCommanderPage(commander.slug);
+    if (!result || !result.keyCards.length) {
+      failed++;
+      continue;
+    }
 
     allDecks.push({
-      id: `archidekt-${deck.id}`,
-      name: deck.name,
-      commander: deck.commander ?? null,
-      source: 'Archidekt',
-      sourceUrl: `https://archidekt.com/decks/${deck.id}`,
+      id: `edhrec-${commander.slug}`,
+      name: `${commander.name} Commander`,
+      commander: commander.name,
+      source: 'EDHREC',
+      sourceUrl: `https://edhrec.com/commanders/${commander.slug}`,
       format: 'commander',
-      strategy: inferStrategy(deck.commander ?? deck.name),
-      colors: inferColors(deck.commander ?? deck.name),
-      viewCount: deck.viewCount,
-      owner: deck.owner ?? null,
-      description: deck.commander
-        ? `${deck.commander} commander deck from Archidekt${deck.owner ? ` by ${deck.owner}` : ''}.`
-        : `Commander deck from Archidekt.`,
-      keyCards: deck.keyCards,
-      edhrecSuggestions,
+      strategy: inferStrategy(commander.name),
+      colors: result.colors,
+      viewCount: result.numDecks ?? commander.numDecks,
+      owner: null,
+      description: `Top recommended cards for ${commander.name} commander decks, based on EDHREC data.`,
+      keyCards: result.keyCards,
+      edhrecSuggestions: [],
       syncedAt: new Date().toISOString(),
     });
+
+    fetched++;
+    if (fetched % 25 === 0) {
+      console.log(`  ${fetched}/${topCommanders.length} commanders fetched`);
+    }
   }
 
-  console.log(`\n  Built ${allDecks.length} enriched commander decks`);
+  console.log(`  Done: ${fetched} succeeded, ${failed} failed`);
   return allDecks;
 }
 
 // ── Write to Firestore ────────────────────────────────────────────────────────
 
 async function writeToFirestore(allDecks) {
-  console.log('\n── Writing to Firestore ──');
+  console.log('\n-- Writing to Firestore --');
   const today = new Date().toISOString().split('T')[0];
-
-  // All decks are commander format
   const format = 'commander';
-  console.log(`  commander: writing ${allDecks.length} decks…`);
 
   await db.collection('meta_decks').doc(format).set(
     { format, deckCount: allDecks.length, syncDate: today, lastUpdated: new Date() },
@@ -372,13 +216,14 @@ async function writeToFirestore(allDecks) {
     await batch.commit();
     console.log(`  Written ${Math.min(i + 400, allDecks.length)}/${allDecks.length}`);
   }
-  console.log(`  commander: done`);
+
+  console.log('  Firestore write complete');
 }
 
-// ── Write to Firebase Storage (optional) ─────────────────────────────────────
+// ── Write backup to Storage (optional) ───────────────────────────────────────
 
 async function writeToStorage(allDecks) {
-  console.log('\n── Writing backup to Storage ──');
+  console.log('\n-- Writing backup to Storage --');
   try {
     const json = JSON.stringify(allDecks);
     console.log(`  Size: ${(Buffer.byteLength(json) / 1024 / 1024).toFixed(1)} MB`);
@@ -396,10 +241,10 @@ async function writeToStorage(allDecks) {
 async function main() {
   console.log(`Deck sync started at ${new Date().toISOString()}`);
 
-  const allDecks = await syncCommander(500);
+  const allDecks = await syncCommander(100);
 
   if (!allDecks.length) {
-    console.error('No decks collected — aborting.');
+    console.error('No decks collected -- aborting.');
     process.exit(1);
   }
 
