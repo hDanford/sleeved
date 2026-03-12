@@ -3,7 +3,7 @@
 // scores them against the user's collection, and allows filtering/sorting.
 
 import { useState, useEffect, useRef } from 'react';
-import { loadDecksForFormat, SUPPORTED_FORMATS } from '../utils/deckCatalog';
+import { loadDecksForFormat, SUPPORTED_FORMATS, fetchAndCacheCommanderDeck } from '../utils/deckCatalog';
 import {
   scoreDeck,
   calculateMainScore,
@@ -395,6 +395,11 @@ export default function DeckSuggestions({ userCollection }) {
   const [activeStrategy, setActiveStrategy] = useState('all');
   const [weights, setWeights] = useState({ ...DEFAULT_WEIGHTS });
 
+  // Commander search
+  const [cmdSearch, setCmdSearch] = useState('');
+  const [cmdSearching, setCmdSearching] = useState(false);
+  const [cmdSearchError, setCmdSearchError] = useState(null);
+
   // Catalog state
   const [rawDecks, setRawDecks] = useState([]);
   const [loadingCatalog, setLoadingCatalog] = useState(false);
@@ -416,6 +421,40 @@ export default function DeckSuggestions({ userCollection }) {
     if (!user) return;
     getDeckProfiles().then((p) => { profilesRef.current = p; }).catch(() => {});
   }, [user]);
+
+  // ── Commander search ──
+  async function handleCommanderSearch(e) {
+    e.preventDefault();
+    const name = cmdSearch.trim();
+    if (!name) return;
+
+    // Already in the list?
+    const slug = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '-');
+    const alreadyLoaded = rawDecks.some((d) => d.id === `edhrec-${slug}`);
+    if (alreadyLoaded) {
+      setCmdSearch('');
+      return;
+    }
+
+    setCmdSearching(true);
+    setCmdSearchError(null);
+    try {
+      const deck = await fetchAndCacheCommanderDeck(name);
+      if (!deck) {
+        setCmdSearchError(`No EDHREC data found for "${name}". Check the spelling.`);
+      } else {
+        setRawDecks((prev) => {
+          const exists = prev.some((d) => d.id === deck.id);
+          return exists ? prev : [deck, ...prev];
+        });
+        setCmdSearch('');
+      }
+    } catch {
+      setCmdSearchError('Search failed. Check your connection and try again.');
+    } finally {
+      setCmdSearching(false);
+    }
+  }
 
   // ── Load catalog ──
   useEffect(() => {
@@ -513,6 +552,49 @@ export default function DeckSuggestions({ userCollection }) {
             );
           })}
         </div>
+
+        {/* Commander search — only shown in commander format */}
+        {activeFormat === 'commander' && (
+          <div style={{ marginBottom: 18, paddingTop: 14, borderTop: '1px solid #181a2a' }}>
+            <div style={{ fontSize: 11, color: '#334155', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>
+              Search Commander
+            </div>
+            <form onSubmit={handleCommanderSearch} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <input
+                type="text"
+                placeholder="e.g. Atraxa, Praetors' Voice"
+                value={cmdSearch}
+                onChange={(e) => { setCmdSearch(e.target.value); setCmdSearchError(null); }}
+                disabled={cmdSearching}
+                style={{
+                  width: '100%', boxSizing: 'border-box',
+                  background: '#080a18', border: '1px solid #1e2030',
+                  borderRadius: 7, padding: '7px 10px',
+                  color: '#e2e8f0', fontSize: 12,
+                  outline: 'none', opacity: cmdSearching ? 0.5 : 1,
+                }}
+              />
+              <button
+                type="submit"
+                disabled={cmdSearching || !cmdSearch.trim()}
+                style={{
+                  background: cmdSearching || !cmdSearch.trim() ? '#1e2030' : '#3730a3',
+                  border: 'none', borderRadius: 7, padding: '7px 0',
+                  color: cmdSearching || !cmdSearch.trim() ? '#334155' : '#e2e8f0',
+                  fontSize: 12, fontWeight: 600, cursor: cmdSearching || !cmdSearch.trim() ? 'default' : 'pointer',
+                  transition: 'all 0.15s',
+                }}
+              >
+                {cmdSearching ? 'Searching…' : 'Add Commander'}
+              </button>
+              {cmdSearchError && (
+                <p style={{ margin: 0, fontSize: 11, color: '#f87171', lineHeight: 1.4 }}>
+                  {cmdSearchError}
+                </p>
+              )}
+            </form>
+          </div>
+        )}
 
         {/* Strategy */}
         {strategies.length > 2 && (
