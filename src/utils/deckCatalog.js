@@ -16,6 +16,7 @@ import {
   limit,
 } from 'firebase/firestore';
 import { db } from './firebaseConfig';
+import { buildCommanderDeck } from './edhrecDeckBuilder';
 
 // In-memory cache per format so the page doesn't re-fetch on each render
 const _cache = new Map(); // format → { decks, fetchedAt }
@@ -187,21 +188,7 @@ export async function fetchAndCacheCommanderDeck(commanderName) {
     const cardlists = jsonDict?.cardlists ?? [];
     const commanderCard = jsonDict?.card ?? {};
 
-    const keyCards = [];
-    const seen = new Set();
-    for (const list of cardlists) {
-      for (const card of list?.cardviews ?? []) {
-        if (!card?.name || seen.has(card.name)) continue;
-        seen.add(card.name);
-        keyCards.push({
-          name: card.name,
-          quantity: 1,
-          section: 'mainboard',
-          inclusion: card.inclusion ?? 0,
-          synergy: card.synergy ?? 0,
-        });
-      }
-    }
+    const { keyCards, swapIns } = buildCommanderDeck(cardlists, jsonDict?.average ?? {});
 
     if (!keyCards.length) return null;
 
@@ -219,6 +206,7 @@ export async function fetchAndCacheCommanderDeck(commanderName) {
       description: `Top recommended cards for ${commanderName} commander decks, based on EDHREC data.`,
       keyCards,
       edhrecSuggestions: [],
+      swapIns,
       syncedAt: new Date().toISOString(),
       syncDate: new Date().toISOString().split('T')[0],
     };
