@@ -163,8 +163,10 @@ function DeckDetailModal({ deck, onClose }) {
   if (!deck) return null;
   const cards = deck.keyCards ?? [];
   const commander = cards.filter((c) => c.section === 'commander');
-  const mainboard = cards.filter((c) => c.section === 'mainboard' || c.section === 'land');
+  const mainboard = cards.filter((c) => c.section === 'mainboard');
+  const lands = cards.filter((c) => c.section === 'land');
   const sideboard = cards.filter((c) => c.section === 'sideboard');
+  const swapIns = deck.swapIns ?? [];
   const totalCards = cards.reduce((s, c) => s + (c.quantity ?? 1), 0);
 
   return (
@@ -294,7 +296,40 @@ function DeckDetailModal({ deck, onClose }) {
             <div>
               <CardSection title="Commander" cards={commander} />
               <CardSection title="Mainboard" cards={mainboard} />
+              <CardSection title="Lands" cards={lands} />
               <CardSection title="Sideboard" cards={sideboard} />
+              {swapIns.length > 0 && (
+                <div style={{ marginTop: 20 }}>
+                  <div style={{
+                    fontSize: 11, color: '#475569', fontWeight: 700,
+                    textTransform: 'uppercase', letterSpacing: 1, marginBottom: 6,
+                    display: 'flex', alignItems: 'center', gap: 6,
+                  }}>
+                    <span style={{
+                      background: '#1e3a5f', color: '#60a5fa',
+                      borderRadius: 4, padding: '1px 6px', fontSize: 10,
+                    }}>BENCH</span>
+                    Cards to Swap In
+                  </div>
+                  <p style={{ fontSize: 11, color: '#334155', marginBottom: 8, lineHeight: 1.4 }}>
+                    High-inclusion cards that didn't make the 99 — sorted by how often they appear in real decks.
+                  </p>
+                  {swapIns.map((c, i) => (
+                    <div key={`${c.name}-${i}`} style={{
+                      display: 'flex', justifyContent: 'space-between',
+                      fontSize: 12, padding: '3px 8px',
+                      borderRadius: 4, background: i % 2 === 0 ? '#0a0c1a' : 'transparent',
+                    }}>
+                      <span style={{ color: '#94a3b8' }}>{c.name}</span>
+                      {c.inclusion > 0 && (
+                        <span style={{ color: '#475569', fontFamily: 'monospace', fontSize: 11 }}>
+                          {c.inclusion}% of decks
+                        </span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           </div>
         </div>
