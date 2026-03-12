@@ -186,6 +186,119 @@ function normalizeColors(colorIdentity) {
   return colorIdentity.map((c) => COLOR_MAP[c?.toUpperCase()] ?? c).filter(Boolean);
 }
 
+// ── Deck builder (mirrors src/utils/edhrecDeckBuilder.js) ────────────────────
+// Kept inline so this script has no local dependencies.
+
+const HEADER_TYPE_MAP = {
+  'Creatures':         'creatures',
+  'Instants':          'instants',
+  'Sorceries':         'sorceries',
+  'Mana Artifacts':    'manaArtifacts',
+  'Utility Artifacts': 'artifacts',
+  'Enchantments':      'enchantments',
+  'Planeswalkers':     'planeswalkers',
+  'Battles':           'battles',
+  'Utility Lands':     'lands',
+  'Lands':             'lands',
+};
+
+const BONUS_HEADERS = new Set(['High Synergy Cards', 'Top Cards', 'Game Changers', 'New Cards']);
+
+const DEFAULT_DIST = {
+  creatures: 27, instants: 10, sorceries: 7,
+  manaArtifacts: 6, artifacts: 5, enchantments: 5,
+  planeswalkers: 2, battles: 0, lands: 37,
+};
+
+function buildCommanderDeck(cardlists, averageDeck = {}) {
+  const dist = {
+    creatures:     averageDeck.creature     ?? DEFAULT_DIST.creatures,
+    instants:      averageDeck.instant      ?? DEFAULT_DIST.instants,
+    sorceries:     averageDeck.sorcery      ?? DEFAULT_DIST.sorceries,
+    manaArtifacts: Math.round((averageDeck.artifact ?? 11) * 0.55),
+    artifacts:     Math.round((averageDeck.artifact ?? 11) * 0.45),
+    enchantments:  averageDeck.enchantment  ?? DEFAULT_DIST.enchantments,
+    planeswalkers: averageDeck.planeswalker ?? DEFAULT_DIST.planeswalkers,
+    battles:       averageDeck.battle       ?? DEFAULT_DIST.battles,
+    lands:         averageDeck.land         ?? DEFAULT_DIST.lands,
+  };
+  const total = Object.values(dist).reduce((s, n) => s + n, 0);
+  if (total > 99) dist.lands -= (total - 99);
+
+  const pools = {};
+  const bonusPool = new Map();
+
+  for (const list of cardlists) {
+    const type = HEADER_TYPE_MAP[list.header ?? ''];
+    for (const card of list.cardviews ?? []) {
+      if (!card?.name) continue;
+      if (type) {
+        if (!pools[type]) pools[type] = new Map();
+        if (!pools[type].has(card.name)) pools[type].set(card.name, card);
+      } else if (BONUS_HEADERS.has(list.header)) {
+        if (!bonusPool.has(card.name)) bonusPool.set(card.name, card);
+      }
+    }
+  }
+
+  const sorted = {};
+  for (const [type, map] of Object.entries(pools)) {
+    sorted[type] = [...map.values()].sort((a, b) => (b.inclusion ?? 0) - (a.inclusion ?? 0));
+  }
+  const sortedBonus = [...bonusPool.values()].sort((a, b) => (b.inclusion ?? 0) - (a.inclusion ?? 0));
+
+  const selected = new Set();
+  const keyCards = [];
+  const overflow = [];
+
+  function pick(type, section = 'mainboard') {
+    const target = dist[type] ?? 0;
+    const pool = sorted[type] ?? [];
+    let taken = 0;
+    for (const card of pool) {
+      if (selected.has(card.name)) continue;
+      if (taken < target) {
+        keyCards.push({ name: card.name, quantity: 1, section, inclusion: card.inclusion ?? 0, synergy: card.synergy ?? 0 });
+        selected.add(card.name);
+        taken++;
+      } else {
+        overflow.push(card);
+      }
+    }
+    return target - taken;
+  }
+
+  let shortfall = 0;
+  shortfall += pick('creatures');
+  shortfall += pick('instants');
+  shortfall += pick('sorceries');
+  shortfall += pick('manaArtifacts');
+  shortfall += pick('artifacts');
+  shortfall += pick('enchantments');
+  shortfall += pick('planeswalkers');
+  shortfall += pick('battles');
+  shortfall += pick('lands', 'land');
+
+  for (const card of sortedBonus) {
+    if (shortfall <= 0) break;
+    if (selected.has(card.name)) continue;
+    keyCards.push({ name: card.name, quantity: 1, section: 'mainboard', inclusion: card.inclusion ?? 0, synergy: card.synergy ?? 0 });
+    selected.add(card.name);
+    shortfall--;
+  }
+
+  const swapInsSeen = new Set();
+  const swapIns = [];
+  for (const card of [...overflow, ...sortedBonus.filter(c => !selected.has(c.name))].sort((a, b) => (b.inclusion ?? 0) - (a.inclusion ?? 0))) {
+    if (swapInsSeen.has(card.name)) continue;
+    swapInsSeen.add(card.name);
+    swapIns.push({ name: card.name, quantity: 1, section: 'mainboard', inclusion: card.inclusion ?? 0, synergy: card.synergy ?? 0 });
+    if (swapIns.length >= 30) break;
+  }
+
+  return { keyCards, swapIns };
+}
+
 // ── EDHREC per-commander fetch ────────────────────────────────────────────────
 
 async function fetchCommanderPage(slug) {
@@ -193,30 +306,16 @@ async function fetchCommanderPage(slug) {
   try {
     const data = await fetchJson(url);
     const jsonDict = data?.container?.json_dict ?? {};
-    const cardlists = jsonDict?.cardlists ?? [];
-
     const commanderCard = jsonDict?.card ?? {};
     const colors = normalizeColors(commanderCard?.color_identity);
     const numDecks = commanderCard?.num_decks ?? 0;
 
-    const keyCards = [];
-    const seen = new Set();
+    const { keyCards, swapIns } = buildCommanderDeck(
+      jsonDict?.cardlists ?? [],
+      jsonDict?.average ?? {}
+    );
 
-    for (const list of cardlists) {
-      for (const card of list?.cardviews ?? []) {
-        if (!card?.name || seen.has(card.name)) continue;
-        seen.add(card.name);
-        keyCards.push({
-          name: card.name,
-          quantity: 1,
-          section: 'mainboard',
-          inclusion: card.inclusion ?? 0,
-          synergy: card.synergy ?? 0,
-        });
-      }
-    }
-
-    return { keyCards, colors, numDecks };
+    return { keyCards, swapIns, colors, numDecks };
   } catch (e) {
     console.warn(`  Failed "${slug}": ${e.message}`);
     return null;
@@ -263,6 +362,7 @@ async function syncCommander() {
       owner: null,
       description: `Top recommended cards for ${commander.name} commander decks, based on EDHREC data.`,
       keyCards: result.keyCards,
+      swapIns: result.swapIns,
       edhrecSuggestions: [],
       syncedAt: new Date().toISOString(),
     });
