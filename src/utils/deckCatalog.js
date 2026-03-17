@@ -2,9 +2,10 @@
 // Reads the nightly-synced deck catalog from Firestore.
 // Firestore path: meta_decks/{format}/decks/{deckId}
 //
-// Decks are written by scripts/sync-decks.mjs each night.
-// When Firestore is empty for Commander (e.g. sync script hasn't run yet),
-// this module falls back to building decks live from Scryfall.
+// When Firestore is empty (sync script hasn't run yet), every format falls
+// back to building decks live from Scryfall:
+//   - commander  → scryfallCommanderSource (31 pre-built archetypes)
+//   - standard / modern / pioneer → scryfallSource (archetype query builder)
 
 import {
   collection,
@@ -18,6 +19,7 @@ import {
   fetchCommanderDeckByName,
   fetchScryfallCommanderDecks,
 } from './deckSources/scryfallCommanderSource';
+import { fetchScryfallArchetypeDecks } from './deckSources/scryfallSource';
 
 // In-memory cache per format so the page doesn't re-fetch on each render
 const _cache = new Map(); // format → { decks, fetchedAt }
@@ -41,9 +43,8 @@ export async function getFormatMeta(format) {
 /**
  * loadDecksForFormat
  * Fetches all decks for a given format from Firestore.
- * For Commander, falls back to building decks live from Scryfall when
- * Firestore is empty (e.g. the nightly sync hasn't run yet).
- * Results are cached in memory for 30 minutes.
+ * When Firestore is empty or unavailable, falls back to a live Scryfall build
+ * so the page always has something to show.
  *
  * @param {string} format  'standard' | 'modern' | 'pioneer' | 'commander'
  * @returns {Promise<Array>}  Array of deck objects
@@ -69,9 +70,7 @@ export async function loadDecksForFormat(format) {
     console.warn('[deckCatalog] Firestore unavailable for', format, '—', err.message);
   }
 
-  // ── Firestore empty / unavailable ──────────────────────────────────────────
-  // For Commander, build a live catalog from Scryfall pre-built archetypes.
-  // Other formats return empty (their Scryfall fallback lives in deckSuggestions).
+  // ── Firestore empty / unavailable — build live from Scryfall ───────────────
   if (format === 'commander') {
     console.log('[deckCatalog] Building Commander catalog from Scryfall (Firestore empty)');
     try {
@@ -82,6 +81,18 @@ export async function loadDecksForFormat(format) {
       }
     } catch (err) {
       console.warn('[deckCatalog] Scryfall commander fallback failed:', err.message);
+    }
+  } else {
+    // standard | modern | pioneer
+    console.log(`[deckCatalog] Building ${format} catalog from Scryfall (Firestore empty)`);
+    try {
+      const decks = await fetchScryfallArchetypeDecks(format);
+      if (decks.length > 0) {
+        _cache.set(format, { decks, fetchedAt: Date.now() });
+        return decks;
+      }
+    } catch (err) {
+      console.warn(`[deckCatalog] Scryfall ${format} fallback failed:`, err.message);
     }
   }
 
