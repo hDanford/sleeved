@@ -250,49 +250,29 @@ function DeckDetailModal({ deck, onClose }) {
                       ${deck.totalCost?.toFixed(2) ?? '—'}
                     </span>
                   </div>
-                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
-                    {deck.missingCards.map((c) => (
-                      <div key={c.name} style={{
-                        display: 'flex', justifyContent: 'space-between',
-                        padding: '5px 10px', background: '#0a0c1a',
-                        border: '1px solid #1a1d2e', borderRadius: 6, fontSize: 12,
-                      }}>
-                        <span style={{ color: '#94a3b8' }}>
-                          <span style={{ color: '#334155', marginRight: 6 }}>{c.quantity}×</span>
-                          {c.name}
+                  {deck.missingCards.slice(0, 12).map((c) => (
+                    <div key={c.name} style={{
+                      display: 'flex', justifyContent: 'space-between',
+                      fontSize: 12, padding: '3px 0', color: '#64748b',
+                    }}>
+                      <span>{c.quantity > 1 ? `${c.quantity}× ` : ''}{c.name}</span>
+                      {c.price_usd > 0 && (
+                        <span style={{ color: '#f59e0b', fontFamily: 'monospace' }}>
+                          ${parseFloat(c.price_usd).toFixed(2)}
                         </span>
-                        {c.price_usd > 0 && (
-                          <span style={{ color: '#f59e0b', fontFamily: 'monospace' }}>
-                            ${(c.price_usd * c.quantity).toFixed(2)}
-                          </span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Source link */}
-              {deck.sourceUrl && (
-                <div style={{ marginTop: 20 }}>
-                  <a href={deck.sourceUrl} target="_blank" rel="noopener noreferrer"
-                    style={{
-                      display: 'inline-flex', alignItems: 'center', gap: 6,
-                      background: '#1a1d2e', border: '1px solid #2a2d45',
-                      color: '#818cf8', borderRadius: 8,
-                      padding: '9px 14px', fontSize: 13, textDecoration: 'none',
-                      transition: 'border-color 0.15s',
-                    }}
-                    onMouseEnter={(e) => e.currentTarget.style.borderColor = '#818cf8'}
-                    onMouseLeave={(e) => e.currentTarget.style.borderColor = '#2a2d45'}
-                  >
-                    🔗 View on {deck.source}
-                  </a>
+                      )}
+                    </div>
+                  ))}
+                  {deck.missingCards.length > 12 && (
+                    <div style={{ fontSize: 11, color: '#334155', marginTop: 4 }}>
+                      +{deck.missingCards.length - 12} more
+                    </div>
+                  )}
                 </div>
               )}
             </div>
 
-            {/* Right: full card list */}
+            {/* Right: decklist */}
             <div>
               <CardSection title="Commander" cards={commander} />
               <CardSection title="Mainboard" cards={mainboard} />
@@ -331,6 +311,7 @@ function DeckDetailModal({ deck, onClose }) {
                 </div>
               )}
             </div>
+
           </div>
         </div>
       </div>
@@ -463,9 +444,12 @@ export default function DeckSuggestions({ userCollection }) {
     const name = cmdSearch.trim();
     if (!name) return;
 
-    // Already in the list?
-    const slug = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '-');
-    const alreadyLoaded = rawDecks.some((d) => d.id === `edhrec-${slug}`);
+    // Already in the list? Check both the new scryfall-cmd- prefix and the legacy edhrec- prefix.
+    const scryfallSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+    const legacySlug   = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '-');
+    const alreadyLoaded = rawDecks.some(
+      (d) => d.id === `scryfall-cmd-${scryfallSlug}` || d.id === `edhrec-${legacySlug}`
+    );
     if (alreadyLoaded) {
       setCmdSearch('');
       return;
@@ -476,7 +460,7 @@ export default function DeckSuggestions({ userCollection }) {
     try {
       const deck = await fetchAndCacheCommanderDeck(name);
       if (!deck) {
-        setCmdSearchError(`No EDHREC data found for "${name}". Check the spelling.`);
+        setCmdSearchError(`Commander not found for "${name}". Check the spelling and try the full card name.`);
       } else {
         setRawDecks((prev) => {
           const exists = prev.some((d) => d.id === deck.id);
@@ -760,7 +744,7 @@ export default function DeckSuggestions({ userCollection }) {
           </div>
         )}
 
-{/* Deck list */}
+        {/* Deck list */}
         {!loadingCatalog && displayDecks.length > 0 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
             {displayDecks.map((deck, i) => (
