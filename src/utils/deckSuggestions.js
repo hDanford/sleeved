@@ -2,7 +2,7 @@
 
 import { resolveCardNames } from './scryfallApi';
 import { scoreDeck, calculateMainScore, DEFAULT_WEIGHTS } from './deckScoring';
-import { fetchEDHRECDecks } from './deckSources/edhrecSource';
+import { fetchScryfallCommanderDecks } from './deckSources/scryfallCommanderSource';
 import { fetchMTGGoldfishDecks, isMTGGoldfishAvailable } from './deckSources/mtgGoldfishSource';
 import { fetchScryfallArchetypeDecks } from './deckSources/scryfallSource';
 
@@ -17,7 +17,7 @@ export async function getCandidateDecks(formats, countPerFormat = 5) {
   const perFormat = await Promise.allSettled(
     formats.map(async (format) => {
       if (format === 'commander') {
-        return fetchEDHRECDecks(countPerFormat);
+        return fetchScryfallCommanderDecks(countPerFormat);
       }
 
       if (isMTGGoldfishAvailable()) {
