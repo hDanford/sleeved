@@ -39,14 +39,11 @@ const COLOR_SYMBOLS = { W: '☀️', U: '💧', B: '💀', R: '🔥', G: '🌿' 
 
 // ─── Score helpers ────────────────────────────────────────────────────────────
 
-// Score decks WITHOUT calling Scryfall — ownership + style work from local data,
-// strength/synergy return neutral values (50/0) until a deck is opened in the modal.
-// This avoids making thousands of API calls on page load.
 function scoreDecksChunk(rawDecks, userCollection, userDeckProfiles, weights) {
   return rawDecks.map((deck) => {
     const scored = scoreDeck({
       deckList: deck.keyCards ?? [],
-      resolvedCards: [], // deferred until modal opens
+      resolvedCards: [],
       userCollection,
       userDeckProfiles,
       weights,
@@ -133,9 +130,15 @@ function SubBar({ label, score, color, icon }) {
 
 // ─── Deck Detail Modal ────────────────────────────────────────────────────────
 
-function CardSection({ title, cards }) {
+/**
+ * CardSection — renders a list of cards with optional price + Scryfall link.
+ * priceMap: Map<nameLower, { price_usd, scryfall_uri }>
+ * ownedSet: Set<nameLower> — cards the user has in their collection
+ */
+function CardSection({ title, cards, priceMap, ownedSet }) {
   if (!cards.length) return null;
   const total = cards.reduce((s, c) => s + (c.quantity ?? 1), 0);
+
   return (
     <div style={{ marginBottom: 16 }}>
       <div style={{
@@ -144,30 +147,143 @@ function CardSection({ title, cards }) {
       }}>
         {title} <span style={{ color: '#334155', fontFamily: 'monospace' }}>({total})</span>
       </div>
-      {cards.map((c, i) => (
-        <div key={`${c.name}-${i}`} style={{
-          display: 'flex', gap: 8, fontSize: 12, padding: '3px 8px',
-          borderRadius: 4, background: i % 2 === 0 ? '#0a0c1a' : 'transparent',
-        }}>
-          <span style={{ color: '#334155', fontFamily: 'monospace', minWidth: 18, textAlign: 'right' }}>
-            {c.quantity ?? 1}
-          </span>
-          <span style={{ color: '#94a3b8' }}>{c.name}</span>
-        </div>
-      ))}
+      {cards.map((c, i) => {
+        const key = c.name.toLowerCase();
+        const info = priceMap?.get(key);
+        const price = info?.price_usd ? parseFloat(info.price_usd) : null;
+        const uri = info?.scryfall_uri
+          ?? `https://scryfall.com/search?q=!"${encodeURIComponent(c.name)}"`;
+        const owned = ownedSet?.has(key);
+
+        return (
+          <div key={`${c.name}-${i}`} style={{
+            display: 'flex', alignItems: 'center', gap: 8, fontSize: 12,
+            padding: '3px 8px', borderRadius: 4,
+            background: i % 2 === 0 ? '#0a0c1a' : 'transparent',
+          }}>
+            {/* Qty */}
+            <span style={{ color: '#334155', fontFamily: 'monospace', minWidth: 18, textAlign: 'right', flexShrink: 0 }}>
+              {c.quantity ?? 1}
+            </span>
+
+            {/* Name — Scryfall link */}
+            <a
+              href={uri}
+              target="_blank"
+              rel="noopener noreferrer"
+              style={{
+                color: owned ? '#86efac' : '#94a3b8',
+                textDecoration: 'none',
+                flex: 1,
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+                whiteSpace: 'nowrap',
+              }}
+              onMouseEnter={(e) => { e.currentTarget.style.textDecoration = 'underline'; }}
+              onMouseLeave={(e) => { e.currentTarget.style.textDecoration = 'none'; }}
+            >
+              {c.name}
+            </a>
+
+            {/* Owned pip */}
+            {owned && (
+              <span title="In your collection" style={{ fontSize: 10, color: '#22c55e', flexShrink: 0 }}>✓</span>
+            )}
+
+            {/* Price */}
+            {price != null ? (
+              <span style={{ color: '#475569', fontFamily: 'monospace', fontSize: 11, flexShrink: 0 }}>
+                ${(price * (c.quantity ?? 1)).toFixed(2)}
+              </span>
+            ) : priceMap && (
+              <span style={{ color: '#1e2030', fontFamily: 'monospace', fontSize: 11, flexShrink: 0 }}>—</span>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
 
-function DeckDetailModal({ deck, onClose }) {
+function DeckDetailModal({ deck, onClose, userCollection }) {
+  const [priceMap, setPriceMap] = useState(null); // Map<nameLower, { price_usd, scryfall_uri }>
+  const [loadingPrices, setLoadingPrices] = useState(true);
+
+  // Resolve all cards on open to get prices + Scryfall URIs
+  useEffect(() => {
+    if (!deck) return;
+    let cancelled = false;
+
+    const allNames = (deck.keyCards ?? []).map((c) => c.name);
+    const swapNames = (deck.swapIns ?? []).map((c) => c.name);
+    const uniqueNames = [...new Set([...allNames, ...swapNames])];
+
+    resolveCardNames(uniqueNames).then((resolved) => {
+      if (cancelled) return;
+      const map = new Map();
+      for (const card of resolved) {
+        map.set(card.name.toLowerCase(), {
+          price_usd: card.prices?.usd ?? card.prices?.usd_foil ?? null,
+          scryfall_uri: card.scryfall_uri ?? null,
+        });
+      }
+      setPriceMap(map);
+      setLoadingPrices(false);
+    }).catch(() => {
+      if (!cancelled) setLoadingPrices(false);
+    });
+
+    return () => { cancelled = true; };
+  }, [deck?.id]); // eslint-disable-line
+
   if (!deck) return null;
-  const cards = deck.keyCards ?? [];
+
+  const cards     = deck.keyCards ?? [];
   const commander = cards.filter((c) => c.section === 'commander');
   const mainboard = cards.filter((c) => c.section === 'mainboard');
-  const lands = cards.filter((c) => c.section === 'land');
+  const lands     = cards.filter((c) => c.section === 'land');
   const sideboard = cards.filter((c) => c.section === 'sideboard');
-  const swapIns = deck.swapIns ?? [];
+  const swapIns   = deck.swapIns ?? [];
   const totalCards = cards.reduce((s, c) => s + (c.quantity ?? 1), 0);
+
+  // Set of card names already in the deck (for owned-swap dedup)
+  const deckNameSet = new Set(cards.map((c) => c.name.toLowerCase()));
+
+  // Owned set — which deck cards the user already has
+  const ownedSet = new Set(
+    cards
+      .filter((c) => (userCollection?.get(c.name.toLowerCase()) ?? 0) >= (c.quantity ?? 1))
+      .map((c) => c.name.toLowerCase())
+  );
+
+  // Owned swap-ins: bench cards the user already owns that aren't in the main deck
+  const ownedSwapIns = swapIns.filter((c) => {
+    const key = c.name.toLowerCase();
+    return !deckNameSet.has(key) && (userCollection?.get(key) ?? 0) >= 1;
+  });
+
+  // Total deck price from priceMap
+  const totalDeckPrice = priceMap
+    ? cards.reduce((sum, c) => {
+        const info = priceMap.get(c.name.toLowerCase());
+        const price = info?.price_usd ? parseFloat(info.price_usd) : 0;
+        return sum + price * (c.quantity ?? 1);
+      }, 0)
+    : null;
+
+  // Total missing cost (cards not owned × price)
+  const totalMissingCost = priceMap
+    ? cards
+        .filter((c) => c.section !== 'sideboard')
+        .reduce((sum, c) => {
+          const key = c.name.toLowerCase();
+          const have = userCollection?.get(key) ?? 0;
+          const need = Math.max(0, (c.quantity ?? 1) - have);
+          if (need === 0) return sum;
+          const info = priceMap.get(key);
+          return sum + (info?.price_usd ? parseFloat(info.price_usd) * need : 0);
+        }, 0)
+    : null;
 
   return (
     <div onClick={onClose} style={{
@@ -177,12 +293,13 @@ function DeckDetailModal({ deck, onClose }) {
     }}>
       <div onClick={(e) => e.stopPropagation()} style={{
         background: '#0f1121', border: '1px solid #2a2d45',
-        borderRadius: 16, width: '100%', maxWidth: 800,
+        borderRadius: 16, width: '100%', maxWidth: 860,
         maxHeight: '90vh', overflow: 'hidden',
         display: 'flex', flexDirection: 'column',
         animation: 'modalIn 0.2s ease',
       }}>
-        {/* Header */}
+
+        {/* ── Header ── */}
         <div style={{
           padding: '20px 24px 16px', borderBottom: '1px solid #1a1d2e',
           display: 'flex', alignItems: 'flex-start', gap: 16,
@@ -190,28 +307,41 @@ function DeckDetailModal({ deck, onClose }) {
           <ScoreRing score={deck.mainScore ?? 0} size={72} />
           <div style={{ flex: 1, minWidth: 0 }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', marginBottom: 6 }}>
-              <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: '#f1f5f9' }}>
-                {deck.name}
-              </h2>
+              <h2 style={{ margin: 0, fontSize: 20, fontWeight: 800, color: '#f1f5f9' }}>{deck.name}</h2>
               <FormatBadge format={deck.format} />
               <StratBadge strategy={deck.strategy} />
             </div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8, flexWrap: 'wrap' }}>
               <ColorPips colors={deck.colors} />
               <span style={{ fontSize: 12, color: '#334155' }}>·</span>
               <span style={{ fontSize: 12, color: '#64748b' }}>{totalCards} cards</span>
-              {deck.metaShare > 0 && (
+              {totalDeckPrice != null && (
                 <>
                   <span style={{ fontSize: 12, color: '#334155' }}>·</span>
-                  <span style={{ fontSize: 12, color: '#22c55e', fontWeight: 700 }}>
-                    {deck.metaShare.toFixed(1)}% meta share
+                  <span style={{ fontSize: 12, color: '#94a3b8' }}>
+                    Deck value{' '}
+                    <span style={{ color: '#e2e8f0', fontWeight: 700, fontFamily: 'monospace' }}>
+                      ${totalDeckPrice.toFixed(2)}
+                    </span>
                   </span>
                 </>
               )}
+              {totalMissingCost != null && totalMissingCost > 0 && (
+                <>
+                  <span style={{ fontSize: 12, color: '#334155' }}>·</span>
+                  <span style={{ fontSize: 12, color: '#94a3b8' }}>
+                    To acquire{' '}
+                    <span style={{ color: '#f59e0b', fontWeight: 700, fontFamily: 'monospace' }}>
+                      ${totalMissingCost.toFixed(2)}
+                    </span>
+                  </span>
+                </>
+              )}
+              {loadingPrices && (
+                <span style={{ fontSize: 11, color: '#334155' }}>Loading prices…</span>
+              )}
             </div>
-            <p style={{ margin: 0, fontSize: 13, color: '#64748b', lineHeight: 1.5 }}>
-              {deck.description}
-            </p>
+            <p style={{ margin: 0, fontSize: 13, color: '#64748b', lineHeight: 1.5 }}>{deck.description}</p>
           </div>
           <button onClick={onClose} style={{
             background: 'transparent', border: '1px solid #1e2030',
@@ -220,12 +350,13 @@ function DeckDetailModal({ deck, onClose }) {
           }}>✕</button>
         </div>
 
-        {/* Body */}
+        {/* ── Body ── */}
         <div style={{ overflowY: 'auto', padding: '20px 24px', flex: 1 }}>
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 24 }}>
 
-            {/* Left: scores + acquisition */}
+            {/* ── Left column: scores + acquisition + owned swap-ins ── */}
             <div>
+              {/* Score breakdown */}
               <div style={{
                 fontSize: 11, color: '#475569', fontWeight: 700,
                 textTransform: 'uppercase', letterSpacing: 1, marginBottom: 12,
@@ -237,47 +368,156 @@ function DeckDetailModal({ deck, onClose }) {
                   color={m.color} icon={m.icon} />
               ))}
 
-              {/* Missing cards */}
+              {/* Cards to acquire */}
               {deck.missingCards?.length > 0 && (
                 <div style={{ marginTop: 20 }}>
                   <div style={{
                     fontSize: 11, color: '#475569', fontWeight: 700,
                     textTransform: 'uppercase', letterSpacing: 1, marginBottom: 10,
-                    display: 'flex', justifyContent: 'space-between',
+                    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
                   }}>
                     <span>Cards to Acquire</span>
-                    <span style={{ color: '#f59e0b', fontFamily: 'monospace' }}>
-                      ${deck.totalCost?.toFixed(2) ?? '—'}
-                    </span>
+                    {totalMissingCost != null && (
+                      <span style={{ color: '#f59e0b', fontFamily: 'monospace' }}>
+                        ${totalMissingCost.toFixed(2)}
+                      </span>
+                    )}
                   </div>
-                  {deck.missingCards.slice(0, 12).map((c) => (
-                    <div key={c.name} style={{
-                      display: 'flex', justifyContent: 'space-between',
-                      fontSize: 12, padding: '3px 0', color: '#64748b',
-                    }}>
-                      <span>{c.quantity > 1 ? `${c.quantity}× ` : ''}{c.name}</span>
-                      {c.price_usd > 0 && (
-                        <span style={{ color: '#f59e0b', fontFamily: 'monospace' }}>
-                          ${parseFloat(c.price_usd).toFixed(2)}
-                        </span>
-                      )}
-                    </div>
-                  ))}
-                  {deck.missingCards.length > 12 && (
-                    <div style={{ fontSize: 11, color: '#334155', marginTop: 4 }}>
-                      +{deck.missingCards.length - 12} more
-                    </div>
-                  )}
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+                    {deck.missingCards.slice(0, 15).map((c) => {
+                      const key = c.name.toLowerCase();
+                      const info = priceMap?.get(key);
+                      const price = info?.price_usd ? parseFloat(info.price_usd) : null;
+                      const uri = info?.scryfall_uri
+                        ?? `https://scryfall.com/search?q=!"${encodeURIComponent(c.name)}"`;
+                      return (
+                        <div key={c.name} style={{
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                          padding: '5px 10px', background: '#0a0c1a',
+                          border: '1px solid #1a1d2e', borderRadius: 6, fontSize: 12,
+                        }}>
+                          <a
+                            href={uri}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ color: '#94a3b8', textDecoration: 'none', flex: 1 }}
+                            onMouseEnter={(e) => { e.currentTarget.style.color = '#e2e8f0'; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.color = '#94a3b8'; }}
+                          >
+                            <span style={{ color: '#334155', marginRight: 6 }}>{c.quantity}×</span>
+                            {c.name}
+                          </a>
+                          {price != null && price > 0 && (
+                            <span style={{ color: '#f59e0b', fontFamily: 'monospace', marginLeft: 10, flexShrink: 0 }}>
+                              ${(price * c.quantity).toFixed(2)}
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })}
+                    {deck.missingCards.length > 15 && (
+                      <div style={{ fontSize: 11, color: '#334155', padding: '3px 10px' }}>
+                        +{deck.missingCards.length - 15} more
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Owned swap-ins */}
+              {ownedSwapIns.length > 0 && (
+                <div style={{ marginTop: 20 }}>
+                  <div style={{
+                    fontSize: 11, fontWeight: 700, textTransform: 'uppercase',
+                    letterSpacing: 1, marginBottom: 8,
+                    display: 'flex', alignItems: 'center', gap: 6,
+                  }}>
+                    <span style={{
+                      background: '#052e16', color: '#4ade80',
+                      borderRadius: 4, padding: '1px 6px', fontSize: 10,
+                    }}>OWNED</span>
+                    <span style={{ color: '#475569' }}>Cards You Could Swap In</span>
+                  </div>
+                  <p style={{ fontSize: 11, color: '#334155', marginBottom: 8, lineHeight: 1.4 }}>
+                    You already own these high-synergy cards — they didn't make the auto-built 99 but fit the strategy.
+                  </p>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+                    {ownedSwapIns.slice(0, 15).map((c, i) => {
+                      const key = c.name.toLowerCase();
+                      const info = priceMap?.get(key);
+                      const uri = info?.scryfall_uri
+                        ?? `https://scryfall.com/search?q=!"${encodeURIComponent(c.name)}"`;
+                      return (
+                        <div key={c.name} style={{
+                          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                          padding: '4px 8px', borderRadius: 4,
+                          background: i % 2 === 0 ? '#071a12' : 'transparent',
+                          border: '1px solid transparent',
+                        }}>
+                          <a
+                            href={uri}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={{ color: '#86efac', textDecoration: 'none', fontSize: 12, flex: 1 }}
+                            onMouseEnter={(e) => { e.currentTarget.style.textDecoration = 'underline'; }}
+                            onMouseLeave={(e) => { e.currentTarget.style.textDecoration = 'none'; }}
+                          >
+                            {c.name}
+                          </a>
+                          <span style={{ fontSize: 10, color: '#22c55e', marginLeft: 8, flexShrink: 0 }}>✓ owned</span>
+                        </div>
+                      );
+                    })}
+                    {ownedSwapIns.length > 15 && (
+                      <div style={{ fontSize: 11, color: '#334155', padding: '2px 8px' }}>
+                        +{ownedSwapIns.length - 15} more
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              {/* Source link */}
+              {deck.sourceUrl && (
+                <div style={{ marginTop: 20 }}>
+                  <a href={deck.sourceUrl} target="_blank" rel="noopener noreferrer"
+                    style={{
+                      display: 'inline-flex', alignItems: 'center', gap: 6,
+                      background: '#1a1d2e', border: '1px solid #2a2d45',
+                      color: '#818cf8', borderRadius: 8,
+                      padding: '9px 14px', fontSize: 13, textDecoration: 'none',
+                      transition: 'border-color 0.15s',
+                    }}
+                    onMouseEnter={(e) => e.currentTarget.style.borderColor = '#818cf8'}
+                    onMouseLeave={(e) => e.currentTarget.style.borderColor = '#2a2d45'}
+                  >
+                    🔗 View on {deck.source}
+                  </a>
                 </div>
               )}
             </div>
 
-            {/* Right: decklist */}
+            {/* ── Right column: full decklist ── */}
             <div>
-              <CardSection title="Commander" cards={commander} />
-              <CardSection title="Mainboard" cards={mainboard} />
-              <CardSection title="Lands" cards={lands} />
-              <CardSection title="Sideboard" cards={sideboard} />
+              {/* Legend */}
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 12,
+                fontSize: 10, color: '#334155', marginBottom: 10,
+              }}>
+                <span style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                  <span style={{ color: '#86efac' }}>■</span> In your collection
+                </span>
+                {loadingPrices && (
+                  <span style={{ color: '#475569' }}>Loading prices…</span>
+                )}
+              </div>
+
+              <CardSection title="Commander"  cards={commander} priceMap={priceMap} ownedSet={ownedSet} />
+              <CardSection title="Mainboard"  cards={mainboard} priceMap={priceMap} ownedSet={ownedSet} />
+              <CardSection title="Lands"      cards={lands}     priceMap={priceMap} ownedSet={ownedSet} />
+              <CardSection title="Sideboard"  cards={sideboard} priceMap={priceMap} ownedSet={ownedSet} />
+
+              {/* Bench swap-ins (high-inclusion cards that didn't make the 99) */}
               {swapIns.length > 0 && (
                 <div style={{ marginTop: 20 }}>
                   <div style={{
@@ -292,22 +532,52 @@ function DeckDetailModal({ deck, onClose }) {
                     Cards to Swap In
                   </div>
                   <p style={{ fontSize: 11, color: '#334155', marginBottom: 8, lineHeight: 1.4 }}>
-                    High-inclusion cards that didn't make the 99 — sorted by how often they appear in real decks.
+                    High-synergy cards that didn't make the 99 — consider these as upgrades.
                   </p>
-                  {swapIns.map((c, i) => (
-                    <div key={`${c.name}-${i}`} style={{
-                      display: 'flex', justifyContent: 'space-between',
-                      fontSize: 12, padding: '3px 8px',
-                      borderRadius: 4, background: i % 2 === 0 ? '#0a0c1a' : 'transparent',
-                    }}>
-                      <span style={{ color: '#94a3b8' }}>{c.name}</span>
-                      {c.inclusion > 0 && (
-                        <span style={{ color: '#475569', fontFamily: 'monospace', fontSize: 11 }}>
-                          {c.inclusion}% of decks
-                        </span>
-                      )}
-                    </div>
-                  ))}
+                  {swapIns.slice(0, 20).map((c, i) => {
+                    const key = c.name.toLowerCase();
+                    const info = priceMap?.get(key);
+                    const price = info?.price_usd ? parseFloat(info.price_usd) : null;
+                    const uri = info?.scryfall_uri
+                      ?? `https://scryfall.com/search?q=!"${encodeURIComponent(c.name)}"`;
+                    const owned = userCollection?.get(key) ?? 0;
+                    return (
+                      <div key={`${c.name}-${i}`} style={{
+                        display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                        fontSize: 12, padding: '3px 8px',
+                        borderRadius: 4, background: i % 2 === 0 ? '#0a0c1a' : 'transparent',
+                      }}>
+                        <a
+                          href={uri}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          style={{
+                            color: owned >= 1 ? '#86efac' : '#94a3b8',
+                            textDecoration: 'none', flex: 1,
+                          }}
+                          onMouseEnter={(e) => { e.currentTarget.style.textDecoration = 'underline'; }}
+                          onMouseLeave={(e) => { e.currentTarget.style.textDecoration = 'none'; }}
+                        >
+                          {c.name}
+                        </a>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexShrink: 0 }}>
+                          {owned >= 1 && (
+                            <span style={{ fontSize: 10, color: '#22c55e' }}>✓</span>
+                          )}
+                          {c.inclusion > 0 && (
+                            <span style={{ color: '#334155', fontFamily: 'monospace', fontSize: 11 }}>
+                              {c.inclusion}%
+                            </span>
+                          )}
+                          {price != null && price > 0 && (
+                            <span style={{ color: '#475569', fontFamily: 'monospace', fontSize: 11 }}>
+                              ${price.toFixed(2)}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -419,7 +689,7 @@ export default function DeckSuggestions({ userCollection }) {
   // Catalog state
   const [rawDecks, setRawDecks] = useState([]);
   const [loadingCatalog, setLoadingCatalog] = useState(false);
-  const [catalogError, setCatalogError] = useState(null); // null | 'no_data' | 'error'
+  const [catalogError, setCatalogError] = useState(null);
   const [syncDate, setSyncDate] = useState(null);
 
   // Scored state
@@ -444,7 +714,6 @@ export default function DeckSuggestions({ userCollection }) {
     const name = cmdSearch.trim();
     if (!name) return;
 
-    // Already in the list? Check both the new scryfall-cmd- prefix and the legacy edhrec- prefix.
     const scryfallSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
     const legacySlug   = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '-');
     const alreadyLoaded = rawDecks.some(
@@ -503,7 +772,7 @@ export default function DeckSuggestions({ userCollection }) {
     return () => { alive = false; };
   }, [activeFormat]);
 
-  // ── Score decks (synchronous — no Scryfall on list view) ──
+  // ── Score decks ──
   useEffect(() => {
     if (!rawDecks.length) return;
     const scored = scoreDecksChunk(rawDecks, userCollection ?? new Map(), profilesRef.current, weights);
@@ -544,7 +813,6 @@ export default function DeckSuggestions({ userCollection }) {
         background: '#0d0f1e', border: '1px solid #181a2a', borderRadius: 14,
         padding: 18, height: 'fit-content', position: 'sticky', top: 20,
       }}>
-
         {/* Format */}
         <div style={{ marginBottom: 18 }}>
           <div style={{ fontSize: 11, color: '#334155', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>
@@ -572,7 +840,7 @@ export default function DeckSuggestions({ userCollection }) {
           })}
         </div>
 
-        {/* Commander search — only shown in commander format */}
+        {/* Commander search */}
         {activeFormat === 'commander' && (
           <div style={{ marginBottom: 18, paddingTop: 14, borderTop: '1px solid #181a2a' }}>
             <div style={{ fontSize: 11, color: '#334155', fontWeight: 700, textTransform: 'uppercase', letterSpacing: 1, marginBottom: 8 }}>
@@ -600,7 +868,8 @@ export default function DeckSuggestions({ userCollection }) {
                   background: cmdSearching || !cmdSearch.trim() ? '#1e2030' : '#3730a3',
                   border: 'none', borderRadius: 7, padding: '7px 0',
                   color: cmdSearching || !cmdSearch.trim() ? '#334155' : '#e2e8f0',
-                  fontSize: 12, fontWeight: 600, cursor: cmdSearching || !cmdSearch.trim() ? 'default' : 'pointer',
+                  fontSize: 12, fontWeight: 600,
+                  cursor: cmdSearching || !cmdSearch.trim() ? 'default' : 'pointer',
                   transition: 'all 0.15s',
                 }}
               >
@@ -670,7 +939,6 @@ export default function DeckSuggestions({ userCollection }) {
 
       {/* ── Main ── */}
       <main>
-        {/* Header */}
         <div style={{ marginBottom: 16 }}>
           <h1 style={{ fontSize: 22, fontWeight: 800, margin: '0 0 4px', color: '#f1f5f9' }}>
             Deck Suggestions
@@ -690,21 +958,18 @@ export default function DeckSuggestions({ userCollection }) {
           </p>
         </div>
 
-        {/* Loading bar */}
         {loadingCatalog && (
           <div style={{ marginBottom: 14 }}>
             <div style={{ height: 2, background: '#181a2a', borderRadius: 2, overflow: 'hidden' }}>
               <div style={{
                 height: '100%', width: '100%',
                 background: FORMAT_COLORS[activeFormat],
-                borderRadius: 2,
-                animation: 'shimmer 1.2s infinite',
+                borderRadius: 2, animation: 'shimmer 1.2s infinite',
               }} />
             </div>
           </div>
         )}
 
-        {/* Error states */}
         {catalogError === 'error' && !isLoading && (
           <div style={{
             background: '#120a0a', border: '1px solid #5a1d1d', borderRadius: 12,
@@ -734,7 +999,6 @@ export default function DeckSuggestions({ userCollection }) {
           </div>
         )}
 
-        {/* No results after filter */}
         {!isLoading && !catalogError && rawDecks.length > 0 && displayDecks.length === 0 && (
           <div style={{
             background: '#0d0f1e', border: '1px dashed #181a2a', borderRadius: 12,
@@ -744,7 +1008,6 @@ export default function DeckSuggestions({ userCollection }) {
           </div>
         )}
 
-        {/* Deck list */}
         {!loadingCatalog && displayDecks.length > 0 && (
           <div style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
             {displayDecks.map((deck, i) => (
@@ -755,9 +1018,12 @@ export default function DeckSuggestions({ userCollection }) {
         )}
       </main>
 
-      {/* Detail modal */}
       {detailDeck && (
-        <DeckDetailModal deck={detailDeck} onClose={() => setDetailDeck(null)} />
+        <DeckDetailModal
+          deck={detailDeck}
+          onClose={() => setDetailDeck(null)}
+          userCollection={userCollection}
+        />
       )}
     </div>
   );
