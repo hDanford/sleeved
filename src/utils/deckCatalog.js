@@ -3,7 +3,8 @@
 // Firestore path: meta_decks/{format}/decks/{deckId}
 //
 // Decks are written by scripts/sync-decks.mjs each night.
-// Returns real decks only — no placeholders.
+// When Firestore is empty for Commander (e.g. sync script hasn't run yet),
+// this module falls back to building decks live from Scryfall.
 
 import {
   collection,
@@ -11,12 +12,12 @@ import {
   doc,
   getDoc,
   setDoc,
-  query,
-  orderBy,
-  limit,
 } from 'firebase/firestore';
 import { db } from './firebaseConfig';
-import { buildCommanderDeck } from './edhrecDeckBuilder';
+import {
+  fetchCommanderDeckByName,
+  fetchScryfallCommanderDecks,
+} from './deckSources/scryfallCommanderSource';
 
 // In-memory cache per format so the page doesn't re-fetch on each render
 const _cache = new Map(); // format → { decks, fetchedAt }
@@ -40,28 +41,51 @@ export async function getFormatMeta(format) {
 /**
  * loadDecksForFormat
  * Fetches all decks for a given format from Firestore.
+ * For Commander, falls back to building decks live from Scryfall when
+ * Firestore is empty (e.g. the nightly sync hasn't run yet).
  * Results are cached in memory for 30 minutes.
  *
  * @param {string} format  'standard' | 'modern' | 'pioneer' | 'commander'
  * @returns {Promise<Array>}  Array of deck objects
  */
 export async function loadDecksForFormat(format) {
-  // Check in-memory cache
+  // Check in-memory cache first
   const cached = _cache.get(format);
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
     return cached.decks;
   }
 
-  const colRef = collection(db, 'meta_decks', format, 'decks');
-  const snap = await getDocs(colRef);
+  // Try Firestore
+  try {
+    const colRef = collection(db, 'meta_decks', format, 'decks');
+    const snap = await getDocs(colRef);
 
-  if (snap.empty) {
-    return [];
+    if (!snap.empty) {
+      const decks = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+      _cache.set(format, { decks, fetchedAt: Date.now() });
+      return decks;
+    }
+  } catch (err) {
+    console.warn('[deckCatalog] Firestore unavailable for', format, '—', err.message);
   }
 
-  const decks = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
-  _cache.set(format, { decks, fetchedAt: Date.now() });
-  return decks;
+  // ── Firestore empty / unavailable ──────────────────────────────────────────
+  // For Commander, build a live catalog from Scryfall pre-built archetypes.
+  // Other formats return empty (their Scryfall fallback lives in deckSuggestions).
+  if (format === 'commander') {
+    console.log('[deckCatalog] Building Commander catalog from Scryfall (Firestore empty)');
+    try {
+      const decks = await fetchScryfallCommanderDecks(12);
+      if (decks.length > 0) {
+        _cache.set(format, { decks, fetchedAt: Date.now() });
+        return decks;
+      }
+    } catch (err) {
+      console.warn('[deckCatalog] Scryfall commander fallback failed:', err.message);
+    }
+  }
+
+  return [];
 }
 
 /**
@@ -109,113 +133,67 @@ export function filterDecks(decks, { format = 'all', strategy = 'all' } = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// On-demand commander fetch + cache
+// On-demand commander search
 // ---------------------------------------------------------------------------
-
-/** Convert a commander name to an EDHREC slug, e.g. "Atraxa, Praetors' Voice" → "atraxa-praetors-voice" */
-function toEdhrecSlug(name) {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9\s]/g, '')   // strip punctuation
-    .trim()
-    .replace(/\s+/g, '-');          // spaces → hyphens
-}
-
-function inferStrategy(name) {
-  const n = (name ?? '').toLowerCase();
-  if (/burn|aggro|weenie|goblins|affinity|infect/.test(n)) return 'aggro';
-  if (/control|stax|prison/.test(n)) return 'control';
-  if (/combo|storm|breach|reanimator/.test(n)) return 'combo';
-  if (/ramp|landfall|devotion/.test(n)) return 'ramp';
-  if (/tribal|elves|merfolk|zombies|vampires|dragons/.test(n)) return 'tribal';
-  return 'midrange';
-}
-
-const COLOR_MAP = { W: 'W', U: 'U', B: 'B', R: 'R', G: 'G' };
-function normalizeColors(colorIdentity) {
-  if (!Array.isArray(colorIdentity)) return [];
-  return colorIdentity.map((c) => COLOR_MAP[c?.toUpperCase()] ?? c).filter(Boolean);
-}
 
 /**
  * fetchAndCacheCommanderDeck
  *
- * Looks up a commander by name:
- *   1. Returns from in-memory cache if present
- *   2. Checks Firestore (meta_decks/commander/decks/edhrec-{slug})
- *   3. Falls back to fetching EDHREC JSON directly and writing to Firestore
+ * Looks up a commander deck by name using this priority order:
+ *   1. In-memory cache (both Scryfall and legacy EDHREC IDs)
+ *   2. Firestore (new `scryfall-cmd-` prefix, then legacy `edhrec-` prefix)
+ *   3. Scryfall live build via fetchCommanderDeckByName()
+ *      — Archidekt will slot in here as a future step (see scryfallCommanderSource.js)
  *
- * @param {string} commanderName  Exact card name, e.g. "Atraxa, Praetors' Voice"
- * @returns {Promise<object|null>}  Deck object or null if not found
+ * On a successful live build, the deck is written to Firestore and injected
+ * into the in-memory cache so it appears immediately in the catalog list.
+ *
+ * @param {string} commanderName  Exact or close card name, e.g. "Atraxa, Praetors' Voice"
+ * @returns {Promise<object|null>}  Deck object, or null if the commander wasn't found
  */
 export async function fetchAndCacheCommanderDeck(commanderName) {
   if (!commanderName?.trim()) return null;
 
-  const slug = toEdhrecSlug(commanderName.trim());
-  const docId = `edhrec-${slug}`;
-  const docRef = doc(db, 'meta_decks', 'commander', 'decks', docId);
+  const name = commanderName.trim();
 
-  // 1. In-memory cache hit
+  // Derive the IDs we might expect in the cache/Firestore
+  const scryfallSlug = name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '');
+  const legacySlug   = name.toLowerCase().replace(/[^a-z0-9\s]/g, '').trim().replace(/\s+/g, '-');
+  const newDocId     = `scryfall-cmd-${scryfallSlug}`;
+  const oldDocId     = `edhrec-${legacySlug}`;
+
+  // ── 1. In-memory cache ─────────────────────────────────────────────────────
   const cached = _cache.get('commander');
   if (cached) {
-    const hit = cached.decks.find((d) => d.id === docId);
+    const hit = cached.decks.find((d) => d.id === newDocId || d.id === oldDocId);
     if (hit) return hit;
   }
 
-  // 2. Firestore check
-  try {
-    const snap = await getDoc(docRef);
-    if (snap.exists()) {
-      const deck = { id: snap.id, ...snap.data() };
-      // Inject into in-memory cache so it appears in the list
-      _injectIntoCatalogCache('commander', deck);
-      return deck;
+  // ── 2. Firestore ───────────────────────────────────────────────────────────
+  for (const docId of [newDocId, oldDocId]) {
+    try {
+      const snap = await getDoc(doc(db, 'meta_decks', 'commander', 'decks', docId));
+      if (snap.exists()) {
+        const deck = { id: snap.id, ...snap.data() };
+        _injectIntoCatalogCache('commander', deck);
+        return deck;
+      }
+    } catch {
+      // Firestore unavailable or doc missing — try next ID
     }
-  } catch {
-    // Firestore unavailable — fall through to EDHREC fetch
   }
 
-  // 3. Fetch from EDHREC and write to Firestore
+  // ── 3. Live Scryfall build ─────────────────────────────────────────────────
   try {
-    const res = await fetch(
-      `https://json.edhrec.com/pages/commanders/${slug}.json`,
-      { headers: { Accept: 'application/json' } }
-    );
-    if (!res.ok) throw new Error(`EDHREC returned ${res.status}`);
+    const deck = await fetchCommanderDeckByName(name);
+    if (!deck || !deck.keyCards?.length) return null;
 
-    const data = await res.json();
-    const jsonDict = data?.container?.json_dict ?? {};
-    const cardlists = jsonDict?.cardlists ?? [];
-    const commanderCard = jsonDict?.card ?? {};
-
-    const { keyCards, swapIns } = buildCommanderDeck(cardlists, jsonDict?.average ?? {});
-
-    if (!keyCards.length) return null;
-
-    const deck = {
-      id: docId,
-      name: `${commanderName} Commander`,
-      commander: commanderName,
-      source: 'EDHREC',
-      sourceUrl: `https://edhrec.com/commanders/${slug}`,
-      format: 'commander',
-      strategy: inferStrategy(commanderName),
-      colors: normalizeColors(commanderCard?.color_identity),
-      viewCount: commanderCard?.num_decks ?? 0,
-      owner: null,
-      description: `Top recommended cards for ${commanderName} commander decks, based on EDHREC data.`,
-      keyCards,
-      edhrecSuggestions: [],
-      swapIns,
-      syncedAt: new Date().toISOString(),
-      syncDate: new Date().toISOString().split('T')[0],
-    };
-
-    // Write to Firestore so future loads (and the nightly sync) pick it up
+    // Persist to Firestore so subsequent page loads skip the build
     try {
+      const docRef = doc(db, 'meta_decks', 'commander', 'decks', deck.id);
       await setDoc(docRef, deck);
     } catch {
-      // Write failed (e.g. permissions) — still return the deck for this session
+      // Write failed (offline / permissions) — still return the deck for this session
     }
 
     _injectIntoCatalogCache('commander', deck);
